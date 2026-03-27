@@ -7,6 +7,7 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,7 +36,10 @@ public final class BrowserRequestManager {
     private static final String REQUEST_FILE_PREFIX = "request-";
     private static final int DEBUG_PORT = 9777;
     private static final long DISCOVERY_COMMAND_TIMEOUT_MILLIS = 1500L;
+    private static final long DEFAULT_BRIDGE_TIMEOUT_EXTRA_MILLIS = 5000L;
+    private static final long NAVIGATION_POST_BRIDGE_TIMEOUT_EXTRA_MILLIS = 20000L;
     private static final String OS_NAME = System.getProperty("os.name", "").toLowerCase();
+    private static final Charset PROCESS_OUTPUT_CHARSET = Charset.defaultCharset();
 
     private final Path workspaceRoot;
     private final Path sessionRoot;
@@ -89,7 +93,8 @@ public final class BrowserRequestManager {
                     arguments.add("--load-static-resources");
                 }
 
-                String output = execute(arguments, snapshot.timeoutMs() + 5000L, scriptFile, profileDir, stateFile, snapshot.pythonPath());
+                long bridgeTimeoutMillis = snapshot.timeoutMs() + bridgeTimeoutExtraMillis(request);
+                String output = execute(arguments, bridgeTimeoutMillis, scriptFile, profileDir, stateFile, snapshot.pythonPath());
                 return parseResponse(output);
             } finally {
                 try {
@@ -105,8 +110,17 @@ public final class BrowserRequestManager {
     }
 
     public synchronized void close(ExtensionConfig.Snapshot snapshot) {
-        browserSessionLock.lock();
+        boolean locked = false;
         try {
+            try {
+                locked = browserSessionLock.tryLock(2500L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (!locked) {
+                return;
+            }
             Path profileDir = sessionRoot.resolve(PROFILE_DIR_NAME);
             Path stateFile = sessionRoot.resolve(STATE_FILE_NAME);
             if (!Files.exists(profileDir)) {
@@ -114,6 +128,17 @@ public final class BrowserRequestManager {
             }
             Path scriptFile = ensureScriptFile();
             List<String> arguments = new ArrayList<>();
+            arguments.add("--action");
+            arguments.add("cleanup");
+            arguments.add("--browser-type");
+            arguments.add(snapshot.browserType());
+            if (!isEmpty(snapshot.browserPath())) {
+                arguments.add("--browser-path");
+                arguments.add(snapshot.browserPath());
+            }
+            execute(arguments, 8000L, scriptFile, profileDir, stateFile, snapshot.pythonPath());
+
+            arguments = new ArrayList<>();
             arguments.add("--action");
             arguments.add("close");
             arguments.add("--browser-type");
@@ -125,7 +150,9 @@ public final class BrowserRequestManager {
             execute(arguments, 10000L, scriptFile, profileDir, stateFile, snapshot.pythonPath());
         } catch (Exception ignored) {
         } finally {
-            browserSessionLock.unlock();
+            if (locked) {
+                browserSessionLock.unlock();
+            }
         }
     }
 
@@ -165,17 +192,10 @@ public final class BrowserRequestManager {
     }
 
     private Path ensureScriptFile() throws IOException {
-        Path existing = cachedScriptFile;
-        if (existing != null && Files.isRegularFile(existing)) {
-            return existing;
-        }
         synchronized (scriptLock) {
-            if (cachedScriptFile != null && Files.isRegularFile(cachedScriptFile)) {
-                return cachedScriptFile;
-            }
             Path scriptDir = workspaceRoot.resolve(SCRIPT_DIR_NAME);
             Files.createDirectories(scriptDir);
-            Path scriptFile = scriptDir.resolve(SCRIPT_FILE_NAME);
+            Path scriptFile = cachedScriptFile != null ? cachedScriptFile : scriptDir.resolve(SCRIPT_FILE_NAME);
             try (InputStream inputStream = BrowserRequestManager.class.getClassLoader().getResourceAsStream(SCRIPT_RESOURCE_PATH)) {
                 if (inputStream == null) {
                     throw new IllegalStateException("browser bridge script resource not found");
@@ -365,7 +385,7 @@ public final class BrowserRequestManager {
 
     private Thread startOutputReader(InputStream inputStream, StringBuilder output) {
         Thread thread = new Thread(() -> {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, PROCESS_OUTPUT_CHARSET))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     synchronized (output) {
@@ -709,7 +729,7 @@ public final class BrowserRequestManager {
                     .directory(workspaceRoot.toFile())
                     .start();
             StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), PROCESS_OUTPUT_CHARSET))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     if (output.length() > 0) {
@@ -862,6 +882,16 @@ public final class BrowserRequestManager {
 
     private String safeMessage(Exception exception) {
         return exception == null || exception.getMessage() == null ? "unknown error" : exception.getMessage();
+    }
+
+    private long bridgeTimeoutExtraMillis(BrowserRequest request) {
+        if (request == null) {
+            return DEFAULT_BRIDGE_TIMEOUT_EXTRA_MILLIS;
+        }
+        if ("POST".equalsIgnoreCase(request.method()) && request.body().length == 0) {
+            return NAVIGATION_POST_BRIDGE_TIMEOUT_EXTRA_MILLIS;
+        }
+        return DEFAULT_BRIDGE_TIMEOUT_EXTRA_MILLIS;
     }
 
     private String buildPythonFailureMessage(List<String> errors, Exception lastError) {

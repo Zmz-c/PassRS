@@ -6,6 +6,7 @@ import re
 import socket
 import sys
 import time
+import traceback
 from urllib.parse import parse_qsl, urlparse
 
 from DrissionPage import Chromium, ChromiumOptions
@@ -16,8 +17,17 @@ GET_FINAL_RENDER_MAX_SECONDS = 1.1
 GET_RENDER_SETTLE_SECONDS = 0.18
 GET_POLL_INTERVAL_SECONDS = 0.08
 POST_CHALLENGE_WAIT_SECONDS = 1.2
-POST_RETRY_ATTEMPTS = 2
+POST_PROVISIONAL_WAIT_SECONDS = 1.4
+EMPTY_BODY_SETTLE_SECONDS = 0.22
+EMPTY_BODY_HIDDEN_FORM_STABLE_SECONDS = 0.35
+POST_RETRY_ATTEMPTS = 1
 POST_CHALLENGE_BODY_LIMIT = 220000
+BLANK_LIKE_URL_PREFIXES = (
+    "about:blank",
+    "data:",
+    "chrome-error://",
+    "edge-error://",
+)
 BLOCKED_RESOURCE_PATTERNS = [
     "*.png",
     "*.jpg",
@@ -336,14 +346,99 @@ def resolve_request_tab(browser, request):
     return to_tab(browser, getattr(browser, "latest_tab", None))
 
 
-def configure_tab_network(tab, allow_static_resources):
+def resolve_live_tab(tab):
+    if tab is None:
+        return None
+    browser = getattr(tab, "browser", None) or getattr(tab, "_browser", None)
+    tab_id = getattr(tab, "tab_id", None) or getattr(tab, "_tab_id", None)
+    if browser is not None and tab_id:
+        try:
+            resolved = browser.get_tab(tab_id)
+            if resolved is not None:
+                return resolved
+        except Exception:
+            pass
+    if browser is not None:
+        try:
+            latest = to_tab(browser, getattr(browser, "latest_tab", None))
+            if latest is not None:
+                return latest
+        except Exception:
+            pass
+    return tab
+
+
+def safe_tab_url(tab):
+    current_tab = resolve_live_tab(tab)
     try:
-        tab.run_cdp("Network.enable")
+        return getattr(current_tab, "url", "") or ""
+    except Exception:
+        return ""
+
+
+def restore_page_hooks(tab):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return
+    script = """
+(() => {
+    try {
+        if (window.__passrsOriginalFetch) {
+            window.fetch = window.__passrsOriginalFetch;
+        }
+        if (window.__passrsOriginalXhrOpen) {
+            XMLHttpRequest.prototype.open = window.__passrsOriginalXhrOpen;
+        }
+        if (window.__passrsOriginalXhrSend) {
+            XMLHttpRequest.prototype.send = window.__passrsOriginalXhrSend;
+        }
+        if (window.__passrsOriginalFormSubmit) {
+            HTMLFormElement.prototype.submit = window.__passrsOriginalFormSubmit;
+        }
+        if (window.__passrsUnloadHandler) {
+            window.removeEventListener('beforeunload', window.__passrsUnloadHandler, true);
+            window.removeEventListener('pagehide', window.__passrsUnloadHandler, true);
+        }
+        if (typeof window.name === 'string' && window.name.startsWith('__PASSRS__:')) {
+            const separator = window.name.indexOf('\n');
+            window.name = separator >= 0 ? window.name.slice(separator + 1) : '';
+        }
+        delete window.__passrsOriginalFetch;
+        delete window.__passrsOriginalXhrOpen;
+        delete window.__passrsOriginalXhrSend;
+        delete window.__passrsOriginalFormSubmit;
+        delete window.__passrsUnloadHandler;
+        delete window.__passrsLastResponse;
+        delete window.__passrsLastResponseAt;
+        delete window.__passrsHooked;
+        return true;
+    } catch (e) {
+        return false;
+    }
+})();
+"""
+    try:
+        current_tab.run_js(script)
+    except Exception:
+        pass
+
+
+def restore_browser_hooks(browser):
+    for tab in iter_browser_tabs(browser):
+        restore_page_hooks(tab)
+
+
+def configure_tab_network(tab, allow_static_resources):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return
+    try:
+        current_tab.run_cdp("Network.enable")
     except Exception:
         pass
     if not allow_static_resources:
         try:
-            tab.run_cdp("Network.setBlockedURLs", urls=BLOCKED_RESOURCE_PATTERNS)
+            current_tab.run_cdp("Network.setBlockedURLs", urls=BLOCKED_RESOURCE_PATTERNS)
         except Exception:
             pass
 
@@ -415,6 +510,20 @@ def is_empty_body_post(request):
     return request.get("method") == "POST" and not request_has_body(request)
 
 
+def can_replay_urlencoded_as_form(request):
+    if not is_form_urlencoded_post(request):
+        return False
+    body_text = decode_body_text(request.get("body") or b"")
+    if not body_text:
+        return True
+    for segment in body_text.split("&"):
+        if not segment:
+            continue
+        if "=" not in segment:
+            return False
+    return True
+
+
 def is_http_url(value):
     parsed = urlparse(value or "")
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
@@ -428,6 +537,9 @@ def preferred_context_url(request):
 
 
 def set_request_cookies(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return
     cookies = []
     for name, value in parse_headers(request["headers"]):
         if name.lower() != "cookie":
@@ -441,12 +553,15 @@ def set_request_cookies(tab, request):
 
     for cookie_name, cookie_value in cookies:
         try:
-            tab.run_cdp("Network.setCookie", name=cookie_name, value=cookie_value, url=request["url"])
+            current_tab.run_cdp("Network.setCookie", name=cookie_name, value=cookie_value, url=request["url"])
         except Exception:
             pass
 
 
 def submit_form_post_request(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        raise RuntimeError("browser tab is unavailable")
     body_text = decode_body_text(request["body"])
     form_pairs = parse_qsl(body_text, keep_blank_values=True)
     if not form_pairs and body_text:
@@ -474,10 +589,13 @@ def submit_form_post_request(tab, request):
 """
     script = script.replace("__URL__", json.dumps(request["url"]))
     script = script.replace("__PAIRS__", json.dumps(form_pairs, ensure_ascii=False))
-    tab.run_js(script)
+    current_tab.run_js(script)
 
 
 def submit_empty_post_request(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        raise RuntimeError("browser tab is unavailable")
     script = """
 (() => {
     const targetUrl = __URL__;
@@ -491,7 +609,7 @@ def submit_empty_post_request(tab, request):
 })();
 """
     script = script.replace("__URL__", json.dumps(request["url"]))
-    tab.run_js(script)
+    current_tab.run_js(script)
 
 
 def multipart_boundary(content_type):
@@ -557,13 +675,30 @@ def can_submit_as_navigation_post(request):
     if is_empty_body_post(request):
         return True
     if is_form_urlencoded_post(request):
-        return True
+        return can_replay_urlencoded_as_form(request)
     if is_multipart_form_post(request):
         return parse_multipart_form_fields(request) is not None
     return False
 
 
+def can_auto_submit_intermediate(request):
+    if is_empty_body_post(request):
+        return False
+    return can_submit_as_navigation_post(request)
+
+
+def can_auto_submit_challenge_intermediate(request):
+    return request.get("method") == "POST" and is_navigation_post(request)
+
+
+def is_navigation_non_form_post(request):
+    return is_navigation_post(request) and not can_submit_as_navigation_post(request)
+
+
 def submit_multipart_post_request(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        raise RuntimeError("browser tab is unavailable")
     form_parts = parse_multipart_form_fields(request)
     if form_parts is None:
         raise RuntimeError("cannot parse multipart form-data post body")
@@ -591,7 +726,7 @@ def submit_multipart_post_request(tab, request):
 """
     script = script.replace("__URL__", json.dumps(request["url"]))
     script = script.replace("__PARTS__", json.dumps(form_parts, ensure_ascii=False))
-    tab.run_js(script)
+    current_tab.run_js(script)
 
 
 def allowed_script_headers(request):
@@ -690,11 +825,14 @@ def packet_status(packet):
 
 
 def wait_for_document_packet(tab, timeout_seconds):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return None
     deadline = time.time() + timeout_seconds
     last_packet = None
     while time.time() < deadline:
         remaining = max(0.1, deadline - time.time())
-        packet = tab.listen.wait(timeout=min(1.0, remaining))
+        packet = current_tab.listen.wait(timeout=min(1.0, remaining))
         if packet is None:
             break
         last_packet = packet
@@ -705,7 +843,8 @@ def wait_for_page_complete(tab, timeout_seconds):
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            state = tab.run_js("return document.readyState")
+            current_tab = resolve_live_tab(tab)
+            state = current_tab.run_js("return document.readyState")
             if state == "complete":
                 return
         except Exception:
@@ -720,7 +859,8 @@ def wait_for_ready_state(tab, timeout_seconds, acceptable_states):
     accepted = tuple(acceptable_states or ())
     while time.time() < deadline:
         try:
-            last_state = tab.run_js("return document.readyState") or ""
+            current_tab = resolve_live_tab(tab)
+            last_state = current_tab.run_js("return document.readyState") or ""
             if last_state in accepted:
                 return last_state
         except Exception:
@@ -745,7 +885,8 @@ return JSON.stringify({
 });
 """
     try:
-        raw = tab.run_js(script)
+        current_tab = resolve_live_tab(tab)
+        raw = current_tab.run_js(script)
         if not raw:
             return {}
         return json.loads(raw)
@@ -803,34 +944,66 @@ def snapshot_is_populated(snapshot):
     return html_len >= 1500 or text_len >= 80 or child_count >= 8
 
 
+def is_meaningful_document(tab, body_text):
+    snapshot = page_render_snapshot(tab)
+    if snapshot_is_populated(snapshot):
+        return True
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    lowered = (body_text or "").lower()
+    has_active_markup = any(marker in lowered for marker in (
+        "<script",
+        "<form",
+        "<iframe",
+        "<frame",
+        "xmlhttprequest",
+        "fetch(",
+        "<meta http-equiv=\"refresh\"",
+        "<meta http-equiv='refresh'",
+    ))
+    if text_len >= 12:
+        return True
+    if child_count >= 2:
+        return True
+    if html_len >= 1200:
+        return True
+    return has_active_markup
+
+
 def reload_page(tab, timeout_seconds):
     phase_timeout = max(0.35, min(timeout_seconds, GET_RELOAD_READY_MAX_SECONDS))
+    current_tab = resolve_live_tab(tab)
     try:
-        tab.run_cdp("Page.reload", ignoreCache=True)
-        wait_for_ready_state(tab, phase_timeout, ("interactive", "complete"))
+        current_tab.run_cdp("Page.reload", ignoreCache=True)
+        wait_for_ready_state(current_tab, phase_timeout, ("interactive", "complete"))
         return
     except Exception:
         pass
     try:
-        tab.run_js("location.reload()")
-        wait_for_ready_state(tab, phase_timeout, ("interactive", "complete"))
+        current_tab.run_js("location.reload()")
+        wait_for_ready_state(current_tab, phase_timeout, ("interactive", "complete"))
         return
     except Exception:
         pass
-    current_url = getattr(tab, "url", "") or ""
+    current_url = safe_tab_url(current_tab)
     if current_url:
-        tab.get(current_url, retry=0, interval=0, timeout=phase_timeout)
+        current_tab.get(current_url, retry=0, interval=0, timeout=phase_timeout)
 
 
 def page_html(tab):
+    current_tab = resolve_live_tab(tab)
     try:
-        html = getattr(tab, "html", None)
+        html = getattr(current_tab, "html", None)
         if isinstance(html, str) and html:
             return html
     except Exception:
         pass
-    html = tab.run_js("return document.documentElement ? document.documentElement.outerHTML : ''")
-    return html or ""
+    try:
+        html = current_tab.run_js("return document.documentElement ? document.documentElement.outerHTML : ''")
+        return html or ""
+    except Exception:
+        return ""
 
 
 def capture_page_html(tab, timeout_seconds):
@@ -848,13 +1021,17 @@ def capture_page_html(tab, timeout_seconds):
 
 def stop_page_loading(tab):
     try:
-        tab.run_cdp("Page.stopLoading")
+        current_tab = resolve_live_tab(tab)
+        current_tab.run_cdp("Page.stopLoading")
     except Exception:
         pass
 
 
 def evaluate_async_json(tab, script):
-    result = tab.run_cdp(
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        raise RuntimeError("browser tab is unavailable")
+    result = current_tab.run_cdp(
         "Runtime.evaluate",
         expression=script,
         awaitPromise=True,
@@ -892,7 +1069,10 @@ def parse_script_response(tab, result_text, request):
         "body": base64.b64decode(result.get("body_base64", "") or ""),
         "final_url": result.get("final_url", request["url"]),
         "content_type": content_type,
-        "title": getattr(tab, "title", ""),
+        "title": getattr(resolve_live_tab(tab), "title", ""),
+        "navigation_pending": bool(result.get("navigation_pending")),
+        "navigation_kind": result.get("navigation_kind", ""),
+        "challenge_like": bool(result.get("challenge_like")),
     }
 
 
@@ -1103,9 +1283,270 @@ def challenge_body_score(body_text):
     return score
 
 
+def looks_like_challenge_document(body_text):
+    text = (body_text or "").lower()
+    if not text:
+        return False
+
+    hard_markers = [
+        "acw_sc__v2",
+        "arg1=",
+        "anti-bot",
+        "captcha",
+        "cf-browser-verification",
+        "cf_chl_",
+        "challenge-platform",
+        "geetest",
+        "slider captcha",
+        "verify you are human",
+        "waf",
+    ]
+    navigation_markers = [
+        "document.cookie",
+        "window.location",
+        "location.href",
+        "location.replace",
+        "location.reload",
+        "form.submit(",
+        "<meta http-equiv=\"refresh\"",
+        "<meta http-equiv='refresh'",
+    ]
+    timer_markers = [
+        "settimeout(",
+        "setinterval(",
+    ]
+    soft_markers = [
+        "challenge",
+        "verify",
+        "token",
+    ]
+
+    hard_hits = sum(1 for marker in hard_markers if marker in text)
+    navigation_hits = sum(1 for marker in navigation_markers if marker in text)
+    timer_hits = sum(1 for marker in timer_markers if marker in text)
+    soft_hits = sum(1 for marker in soft_markers if marker in text)
+    has_script = "<script" in text
+    has_form = "<form" in text
+
+    if hard_hits >= 1 and (navigation_hits + timer_hits + soft_hits >= 1 or has_script):
+        return True
+    if navigation_hits >= 3 and (has_script or has_form):
+        return True
+    if navigation_hits >= 2 and timer_hits >= 1 and has_script:
+        return True
+    if soft_hits >= 2 and navigation_hits >= 1 and has_script:
+        return True
+    return False
+
+
+def page_looks_like_challenge(tab, body_text):
+    lowered = (body_text or "").lower()
+    if not lowered or len(lowered) > POST_CHALLENGE_BODY_LIMIT:
+        return False
+    if not looks_like_challenge_document(lowered):
+        return False
+
+    snapshot = page_render_snapshot(tab)
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    title = (snapshot.get("title", "") or "").strip()
+
+    hard_markers = (
+        "acw_sc__v2",
+        "arg1=",
+        "anti-bot",
+        "captcha",
+        "cf-browser-verification",
+        "cf_chl_",
+        "challenge-platform",
+        "geetest",
+        "slider captcha",
+        "verify you are human",
+        "waf",
+    )
+    hard_hit = any(marker in lowered for marker in hard_markers)
+
+    if hard_hit:
+        return True
+    if html_len >= 5000 and text_len >= 160 and child_count >= 6 and title:
+        return False
+    if html_len >= 3500 and text_len >= 120 and child_count >= 6:
+        return False
+    if text_len >= 280:
+        return False
+    if child_count >= 14:
+        return False
+    if html_len >= 45000 and title:
+        return False
+    return True
+
+
+def is_blank_like_url(url):
+    lowered = (url or "").strip().lower()
+    if not lowered:
+        return True
+    return lowered.startswith(BLANK_LIKE_URL_PREFIXES)
+
+
+def is_browser_error_url(url):
+    lowered = (url or "").strip().lower()
+    return lowered.startswith("chrome-error://") or lowered.startswith("edge-error://")
+
+
+def browser_error_result(tab, request, body_text):
+    snapshot = page_render_snapshot(tab)
+    current_tab = resolve_live_tab(tab)
+    final_url = snapshot.get("href", "") or safe_tab_url(tab) or request["url"]
+    if not is_browser_error_url(final_url):
+        return None
+
+    title = (snapshot.get("title", "") or getattr(current_tab, "title", "") or "").strip()
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    if html_len < 120 and text_len < 12 and child_count < 2 and not title:
+        return None
+
+    lowered = (body_text or "").lower()
+    status = 502
+    reason = "Bad Gateway"
+    if "504" in title or "504" in lowered:
+        status = 504
+        reason = "Gateway Timeout"
+    elif "503" in title or "503" in lowered:
+        status = 503
+        reason = "Service Unavailable"
+    elif "500" in title or "500" in lowered:
+        status = 500
+        reason = "Internal Server Error"
+    elif "502" in title or "502" in lowered:
+        status = 502
+        reason = "Bad Gateway"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "headers": {
+            "Content-Type": "text/html; charset=UTF-8",
+            "Cache-Control": "no-store",
+        },
+        "body": (body_text or "").encode("utf-8", errors="replace"),
+        "final_url": request["url"],
+        "title": title or reason,
+    }
+
+
+def is_blank_like_snapshot(snapshot):
+    if not snapshot:
+        return True
+    html_len = int(snapshot.get("html_len", 0) or 0)
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    href = snapshot.get("href", "") or ""
+    if html_len >= 128 or text_len >= 12 or child_count >= 2:
+        return False
+    return is_blank_like_url(href) or (html_len < 96 and text_len == 0 and child_count == 0)
+
+
+def is_provisional_browser_document(body_text, snapshot):
+    lowered = (body_text or "").lower()
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    title = (snapshot.get("title", "") or "").strip()
+
+    if html_len >= 8000 or text_len >= 120 or child_count >= 10:
+        return False
+
+    active_markup = any(marker in lowered for marker in (
+        "<script",
+        "<form",
+        "<iframe",
+        "<frame",
+        "fetch(",
+        "xmlhttprequest",
+        "window.location",
+        "location.href",
+        "location.replace",
+        "location.reload",
+        "form.submit(",
+        "<meta http-equiv=\"refresh\"",
+        "<meta http-equiv='refresh'",
+    ))
+
+    if active_markup and text_len < 40 and child_count < 6 and html_len < 5000:
+        return True
+    if not title and text_len < 16 and child_count < 3 and html_len < 1200:
+        return True
+    return False
+
+
+def normalized_document_url(url):
+    value = (url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    return parsed._replace(fragment="").geturl()
+
+
+def can_reload_navigation_result(tab, request):
+    current_url = normalized_document_url(safe_tab_url(tab))
+    if not current_url or not is_http_url(current_url):
+        return False
+    if is_blank_like_url(current_url):
+        return False
+    original_url = normalized_document_url(request["url"])
+    return current_url != original_url
+
+
+def looks_like_hidden_form_intermediate_html(body_text):
+    html = body_text or ""
+    lowered = html.lower()
+    if not lowered or len(lowered) > POST_CHALLENGE_BODY_LIMIT:
+        return False
+    if "<form" not in lowered or "</form>" not in lowered:
+        return False
+
+    form_match = re.search(r"<form\b[^>]*\bmethod\s*=\s*(['\"]?)post\1[^>]*>(.*?)</form>", html, re.IGNORECASE | re.DOTALL)
+    if not form_match:
+        return False
+
+    form_html = form_match.group(0)
+    if re.search(r"<(?:button|select)\b", form_html, re.IGNORECASE):
+        return False
+    if re.search(
+        r"<input\b[^>]*\btype\s*=\s*(['\"]?)(?:text|password|checkbox|radio|file|email|search|url|tel|number|date|datetime-local|month|week|time|color)\1",
+        form_html,
+        re.IGNORECASE,
+    ):
+        return False
+
+    hidden_style = any(marker in lowered for marker in (
+        "visibility:hidden",
+        "visibility: hidden",
+        "display:none",
+        "display: none",
+    ))
+    has_hidden_input = re.search(r"<input\b[^>]*\btype\s*=\s*(['\"]?)hidden\1", form_html, re.IGNORECASE) is not None
+    has_generic_input = re.search(r"<input\b(?![^>]*\btype\s*=)[^>]*\bname\s*=", form_html, re.IGNORECASE) is not None
+    has_textarea = re.search(r"<textarea\b", form_html, re.IGNORECASE) is not None
+
+    visible_text = re.sub(r"<script\b.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    visible_text = re.sub(r"<style\b.*?</style>", " ", visible_text, flags=re.IGNORECASE | re.DOTALL)
+    visible_text = re.sub(r"<[^>]+>", " ", visible_text)
+    visible_text = re.sub(r"\s+", " ", visible_text).strip()
+
+    return (hidden_style or has_hidden_input or has_generic_input or has_textarea) and len(visible_text) <= 120
+
+
 def is_post_challenge_result(result):
     if not result:
         return False
+    if result.get("challenge_like"):
+        return True
     status = int(result.get("status", 0) or 0)
     if status in (401, 403, 409, 412, 425, 428, 429, 503):
         return True
@@ -1115,20 +1556,127 @@ def is_post_challenge_result(result):
     body_text = decode_body_text(result.get("body", b"")).lower()
     if not body_text:
         return False
-    score = challenge_body_score(body_text)
-    if score >= 4 and len(body_text) <= POST_CHALLENGE_BODY_LIMIT:
+    if len(body_text) > POST_CHALLENGE_BODY_LIMIT:
+        return False
+    if looks_like_hidden_form_intermediate_html(body_text):
         return True
-    return score >= 3 and status >= 300 and len(body_text) <= POST_CHALLENGE_BODY_LIMIT
+    if looks_like_challenge_document(body_text):
+        return True
+    score = challenge_body_score(body_text)
+    return score >= 3 and status >= 300 and ("location.reload" in body_text or "form.submit(" in body_text)
 
 
-def load_challenge_page(tab, request, result):
+def build_current_html_result(tab, request, body_text, allow_challenge=False, relaxed=False, min_body_len=128):
+    current_tab = resolve_live_tab(tab)
+    snapshot = page_render_snapshot(tab)
+    final_url = snapshot.get("href", "") or safe_tab_url(tab) or request["url"]
+    if not is_http_url(final_url) or is_blank_like_url(final_url):
+        return None
+
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    title = getattr(current_tab, "title", "") or ""
+
+    if len(body_text) < min_body_len:
+        if not relaxed:
+            return None
+        if len(body_text) < 48 and text_len < 8 and child_count == 0 and not title.strip():
+            return None
+
+    if not relaxed:
+        if not is_meaningful_document(tab, body_text):
+            return None
+    else:
+        if not snapshot_is_populated(snapshot) and text_len < 8 and child_count == 0 and len(body_text) < 96 and not title.strip():
+            return None
+    if is_provisional_browser_document(body_text, snapshot):
+        return None
+
+    lowered = body_text.lower()
+    if not allow_challenge and page_looks_like_challenge(tab, body_text):
+        return None
+    if looks_like_hidden_form_intermediate_html(body_text):
+        return None
+    if hidden_form_intermediate_snapshot(tab, request).get("auto"):
+        return None
+
+    return {
+        "status": 200,
+        "reason": "OK",
+        "headers": {
+            "Content-Type": "text/html; charset=UTF-8",
+            "Cache-Control": "no-store",
+        },
+        "body": body_text.encode("utf-8", errors="replace"),
+        "final_url": final_url,
+        "title": title,
+    }
+
+
+def resolve_provisional_document(tab, request, timeout_seconds):
+    deadline = time.time() + max(0.35, min(timeout_seconds, POST_PROVISIONAL_WAIT_SECONDS))
+    last_signature = None
+    last_change_at = time.time()
+    best_body_text = ""
+
+    while time.time() < deadline:
+        captured_result = captured_browser_result(tab, request)
+        if captured_result is not None:
+            if captured_result.get("navigation_pending"):
+                last_change_at = time.time()
+            elif not is_post_challenge_result(captured_result):
+                return {
+                    "result": captured_result,
+                }
+
+        if hidden_form_intermediate_snapshot(tab, request).get("auto"):
+            return {
+                "retry": True,
+            }
+
+        snapshot = page_render_snapshot(tab)
+        body_text = page_html(tab)
+        if len(body_text) > len(best_body_text):
+            best_body_text = body_text
+
+        signature = (
+            snapshot.get("href", "") or "",
+            snapshot.get("title", "") or "",
+            int(snapshot.get("html_len", 0) or 0),
+            int(snapshot.get("text_len", 0) or 0),
+            int(snapshot.get("child_count", 0) or 0),
+        )
+        if signature != last_signature:
+            last_signature = signature
+            last_change_at = time.time()
+        elif not is_provisional_browser_document(body_text, snapshot) and time.time() - last_change_at >= GET_RENDER_SETTLE_SECONDS:
+            return {
+                "body_text": body_text,
+            }
+
+        time.sleep(GET_POLL_INTERVAL_SECONDS)
+
+    return {
+        "body_text": best_body_text or capture_page_html(tab, 0.3),
+    }
+
+
+def load_challenge_page(tab, request, result, timeout_seconds):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        raise RuntimeError("browser tab is unavailable")
     html = decode_body_text(result.get("body", b""))
     if not html:
         return
+    restore_page_hooks(current_tab)
+    cleanup_timeout_ms = max(5000, int(max(timeout_seconds, 5.0) * 1000))
     script = """
 (() => {
     const url = __URL__;
     const html = __HTML__;
+    const cleanupTimeoutMs = __CLEANUP_TIMEOUT_MS__;
+    const resultPrefix = "__PASSRS__:";
+    const challengeStatuses = new Set([401, 403, 409, 412, 425, 428, 429, 503]);
     const encode = (bytes) => {
         let binary = "";
         const chunkSize = 0x8000;
@@ -1148,29 +1696,206 @@ def load_challenge_page(tab, request, result):
         }
         return String(headers || "");
     };
+    const persistSerialized = (serialized) => {
+        try {
+            const currentName = typeof window.name === "string" ? window.name : "";
+            const preservedName = currentName.startsWith(resultPrefix)
+                ? ((currentName.indexOf("\\n") >= 0) ? currentName.slice(currentName.indexOf("\\n") + 1) : "")
+                : currentName;
+            window.name = `${resultPrefix}${serialized}\\n${preservedName}`;
+        } catch (e) {
+        }
+    };
+    const currentSavedPayload = () => {
+        try {
+            if (!window.__passrsLastResponse) {
+                return null;
+            }
+            return JSON.parse(window.__passrsLastResponse);
+        } catch (e) {
+            return null;
+        }
+    };
+    const hasStableResult = () => {
+        const payload = currentSavedPayload();
+        if (!payload) {
+            return false;
+        }
+        return !payload.navigation_pending && !payload.challenge_like;
+    };
     const saveResult = (payload) => {
         try {
-            window.__passrsLastResponse = JSON.stringify(payload || {});
+            const serialized = JSON.stringify(payload || {});
+            window.__passrsLastResponse = serialized;
             window.__passrsLastResponseAt = Date.now();
+            persistSerialized(serialized);
+        } catch (e) {
+        }
+    };
+    const markNavigationPending = (targetUrl, kind) => {
+        if (hasStableResult()) {
+            return;
+        }
+        saveResult({
+            status: 0,
+            reason: "",
+            headers: "",
+            body_base64: "",
+            final_url: targetUrl || url,
+            navigation_pending: true,
+            navigation_kind: kind || "",
+            challenge_like: false
+        });
+    };
+    const decodeBytes = (bytes) => {
+        try {
+            return new TextDecoder('utf-8').decode(bytes || new Uint8Array(0));
+        } catch (e) {
+            try {
+                return new TextDecoder('gb18030').decode(bytes || new Uint8Array(0));
+            } catch (e2) {
+                let binary = '';
+                const data = bytes || new Uint8Array(0);
+                for (let i = 0; i < data.length; i++) {
+                    binary += String.fromCharCode(data[i]);
+                }
+                return binary;
+            }
+        }
+    };
+    const looksLikeChallengeBody = (text) => {
+        const lowered = String(text || '').toLowerCase();
+        if (!lowered || lowered.length > 220000) {
+            return false;
+        }
+        if (lowered.includes('<form') && (lowered.includes('visibility:hidden') || lowered.includes('visibility: hidden') || lowered.includes('display:none') || lowered.includes('display: none'))) {
+            return true;
+        }
+        const hardMarkers = [
+            'acw_sc__v2',
+            'arg1=',
+            'anti-bot',
+            'captcha',
+            'cf-browser-verification',
+            'cf_chl_',
+            'challenge-platform',
+            'geetest',
+            'slider captcha',
+            'verify you are human',
+            'waf',
+        ];
+        for (const marker of hardMarkers) {
+            if (lowered.includes(marker)) {
+                return true;
+            }
+        }
+        const navigationMarkers = [
+            'document.cookie',
+            'window.location',
+            'location.href',
+            'location.replace',
+            'location.reload',
+            'form.submit(',
+            '<meta http-equiv=\"refresh\"',
+            "<meta http-equiv='refresh'",
+        ];
+        const timerMarkers = ['settimeout(', 'setinterval('];
+        const softMarkers = ['challenge', 'verify', 'token'];
+        let navigationHits = 0;
+        let timerHits = 0;
+        let softHits = 0;
+        for (const marker of navigationMarkers) {
+            if (lowered.includes(marker)) {
+                navigationHits += 1;
+            }
+        }
+        for (const marker of timerMarkers) {
+            if (lowered.includes(marker)) {
+                timerHits += 1;
+            }
+        }
+        for (const marker of softMarkers) {
+            if (lowered.includes(marker)) {
+                softHits += 1;
+            }
+        }
+        const hasScript = lowered.includes('<script');
+        const hasForm = lowered.includes('<form');
+        if (navigationHits >= 3 && (hasScript || hasForm)) {
+            return true;
+        }
+        if (navigationHits >= 2 && timerHits >= 1 && hasScript) {
+            return true;
+        }
+        return softHits >= 2 && navigationHits >= 1 && hasScript;
+    };
+    const isChallengeLike = (status, headersText, bodyBytes) => {
+        if (challengeStatuses.has(Number(status || 0))) {
+            return true;
+        }
+        const loweredHeaders = String(headersText || '').toLowerCase();
+        if (!loweredHeaders.includes('content-type: text/html')) {
+            return false;
+        }
+        return looksLikeChallengeBody(decodeBytes(bodyBytes));
+    };
+    const restoreHooks = () => {
+        try {
+            if (window.__passrsOriginalFetch) {
+                window.fetch = window.__passrsOriginalFetch;
+            }
+            if (window.__passrsOriginalXhrOpen) {
+                XMLHttpRequest.prototype.open = window.__passrsOriginalXhrOpen;
+            }
+            if (window.__passrsOriginalXhrSend) {
+                XMLHttpRequest.prototype.send = window.__passrsOriginalXhrSend;
+            }
+            if (window.__passrsOriginalFormSubmit) {
+                HTMLFormElement.prototype.submit = window.__passrsOriginalFormSubmit;
+            }
+            if (window.__passrsUnloadHandler) {
+                window.removeEventListener("beforeunload", window.__passrsUnloadHandler, true);
+                window.removeEventListener("pagehide", window.__passrsUnloadHandler, true);
+            }
+            if (window.__passrsCleanupTimer) {
+                clearTimeout(window.__passrsCleanupTimer);
+            }
+            delete window.__passrsCleanupTimer;
+            delete window.__passrsOriginalFetch;
+            delete window.__passrsOriginalXhrOpen;
+            delete window.__passrsOriginalXhrSend;
+            delete window.__passrsOriginalFormSubmit;
+            delete window.__passrsUnloadHandler;
+            delete window.__passrsHooked;
         } catch (e) {
         }
     };
     if (!window.__passrsHooked) {
         window.__passrsHooked = true;
         const originalFetch = window.fetch ? window.fetch.bind(window) : null;
+        if (originalFetch && !window.__passrsOriginalFetch) {
+            window.__passrsOriginalFetch = originalFetch;
+        }
+        window.__passrsCleanupTimer = setTimeout(restoreHooks, cleanupTimeoutMs);
         if (originalFetch) {
             window.fetch = async (...args) => {
                 const response = await originalFetch(...args);
                 try {
                     const clone = response.clone();
                     const bodyBytes = new Uint8Array(await clone.arrayBuffer());
+                    const headersText = toHeaderText(response.headers);
+                    const challengeLike = isChallengeLike(response.status, headersText, bodyBytes);
                     saveResult({
                         status: response.status || 0,
                         reason: response.statusText || "",
-                        headers: toHeaderText(response.headers),
+                        headers: headersText,
                         body_base64: encode(bodyBytes),
-                        final_url: response.url || (args[0] && String(args[0])) || url
+                        final_url: response.url || (args[0] && String(args[0])) || url,
+                        challenge_like: challengeLike
                     });
+                    if (!challengeLike) {
+                        restoreHooks();
+                    }
                 } catch (e) {
                 }
                 return response;
@@ -1178,6 +1903,25 @@ def load_challenge_page(tab, request, result):
         }
         const originalOpen = XMLHttpRequest.prototype.open;
         const originalSend = XMLHttpRequest.prototype.send;
+        if (!window.__passrsOriginalXhrOpen) {
+            window.__passrsOriginalXhrOpen = originalOpen;
+        }
+        if (!window.__passrsOriginalXhrSend) {
+            window.__passrsOriginalXhrSend = originalSend;
+        }
+        const originalFormSubmit = HTMLFormElement.prototype.submit;
+        if (!window.__passrsOriginalFormSubmit) {
+            window.__passrsOriginalFormSubmit = originalFormSubmit;
+        }
+        const unloadHandler = () => {
+            markNavigationPending(location.href || url, "unload");
+        };
+        window.__passrsUnloadHandler = unloadHandler;
+        try {
+            window.addEventListener("beforeunload", unloadHandler, true);
+            window.addEventListener("pagehide", unloadHandler, true);
+        } catch (e) {
+        }
         XMLHttpRequest.prototype.open = function(method, targetUrl) {
             this.__passrsMethod = method;
             this.__passrsUrl = targetUrl;
@@ -1193,13 +1937,19 @@ def load_challenge_page(tab, request, result):
                     } else if (typeof xhr.responseText === "string") {
                         bodyBytes = new TextEncoder().encode(xhr.responseText);
                     }
+                    const headersText = xhr.getAllResponseHeaders() || "";
+                    const challengeLike = isChallengeLike(xhr.status, headersText, bodyBytes);
                     saveResult({
                         status: xhr.status || 0,
                         reason: xhr.statusText || "",
-                        headers: xhr.getAllResponseHeaders() || "",
+                        headers: headersText,
                         body_base64: encode(bodyBytes),
-                        final_url: xhr.responseURL || xhr.__passrsUrl || url
+                        final_url: xhr.responseURL || xhr.__passrsUrl || url,
+                        challenge_like: challengeLike
                     });
+                    if (!challengeLike) {
+                        restoreHooks();
+                    }
                 } catch (e) {
                 }
             };
@@ -1209,6 +1959,13 @@ def load_challenge_page(tab, request, result):
                 xhr.addEventListener("loadend", finalize);
             }
             return originalSend.apply(this, arguments);
+        };
+        HTMLFormElement.prototype.submit = function() {
+            try {
+                markNavigationPending(this.action || location.href || url, "form-submit");
+            } catch (e) {
+            }
+            return originalFormSubmit.apply(this, arguments);
         };
     }
     try {
@@ -1223,14 +1980,31 @@ def load_challenge_page(tab, request, result):
 """
     script = script.replace("__URL__", json.dumps(result.get("final_url") or request["url"]))
     script = script.replace("__HTML__", json.dumps(html))
-    tab.run_js(script)
+    script = script.replace("__CLEANUP_TIMEOUT_MS__", json.dumps(cleanup_timeout_ms))
+    current_tab.run_js(script)
 
 
 def captured_browser_result(tab, request):
     try:
-        raw = tab.run_js("""
+        current_tab = resolve_live_tab(tab)
+        raw = current_tab.run_js("""
 (() => {
-    const value = window.__passrsLastResponse || "";
+    const prefix = "__PASSRS__:";
+    const takePersistedValue = () => {
+        try {
+            const currentName = typeof window.name === "string" ? window.name : "";
+            if (!currentName.startsWith(prefix)) {
+                return "";
+            }
+            const separator = currentName.indexOf("\\n");
+            const persisted = separator >= 0 ? currentName.slice(prefix.length, separator) : currentName.slice(prefix.length);
+            window.name = separator >= 0 ? currentName.slice(separator + 1) : "";
+            return persisted;
+        } catch (e) {
+            return "";
+        }
+    };
+    const value = window.__passrsLastResponse || takePersistedValue() || "";
     window.__passrsLastResponse = "";
     return value;
 })();
@@ -1261,7 +2035,8 @@ def wait_for_post_challenge(tab, timeout_seconds):
     last_change_at = time.time()
     while time.time() < deadline:
         try:
-            cookie_text = tab.run_js("return document.cookie || ''") or ""
+            current_tab = resolve_live_tab(tab)
+            cookie_text = current_tab.run_js("return document.cookie || ''") or ""
         except Exception:
             cookie_text = ""
         if cookie_text != last_cookie:
@@ -1282,6 +2057,17 @@ return JSON.stringify((() => {
     if (!form || !body) {
         return {auto: false};
     }
+    const isEffectivelyHidden = (element) => {
+        let current = element;
+        while (current && current.nodeType === 1) {
+            const style = window.getComputedStyle ? window.getComputedStyle(current) : null;
+            if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+                return true;
+            }
+            current = current.parentElement;
+        }
+        return false;
+    };
     const hiddenInputs = form.querySelectorAll('input[type="hidden"], input:not([type]), textarea[hidden]').length;
     const visibleControls = Array.from(form.querySelectorAll('input, button, select, textarea'))
         .filter((element) => {
@@ -1289,8 +2075,7 @@ return JSON.stringify((() => {
             if (type === 'hidden') {
                 return false;
             }
-            const style = window.getComputedStyle ? window.getComputedStyle(element) : null;
-            if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+            if (isEffectivelyHidden(element)) {
                 return false;
             }
             return true;
@@ -1300,10 +2085,18 @@ return JSON.stringify((() => {
     const currentUrl = location.href || '';
     const expectedUrl = __EXPECTED_URL__;
     const sameTarget = !expectedUrl || formAction === expectedUrl || currentUrl === expectedUrl || formAction === currentUrl;
-    const auto = hiddenInputs > 0 && visibleControls == 0 && bodyText.length <= 48 && sameTarget;
+    const formHidden = isEffectivelyHidden(form);
+    const controlCount = form.querySelectorAll('input, button, select, textarea').length;
+    const auto = (hiddenInputs > 0 || formHidden) && visibleControls == 0
+        && controlCount <= 8
+        && (sameTarget || bodyText.length <= 48)
+        && bodyText.length <= 120;
     return {
         auto,
+        same_target: sameTarget,
+        form_hidden: formHidden,
         hidden_inputs: hiddenInputs,
+        control_count: controlCount,
         visible_controls: visibleControls,
         body_text_len: bodyText.length
     };
@@ -1311,7 +2104,8 @@ return JSON.stringify((() => {
 """
     script = script.replace("__EXPECTED_URL__", json.dumps(request["url"]))
     try:
-        raw = tab.run_js(script)
+        current_tab = resolve_live_tab(tab)
+        raw = current_tab.run_js(script)
         if not raw:
             return {}
         return json.loads(raw)
@@ -1341,49 +2135,220 @@ def submit_hidden_form_intermediate(tab, request):
 """
     script = script.replace("__TARGET_URL__", json.dumps(request["url"]))
     try:
-        return bool(tab.run_js(script))
+        current_tab = resolve_live_tab(tab)
+        return bool(current_tab.run_js(script))
     except Exception:
         return False
 
 
 def current_page_result(tab, request):
     body_text = capture_page_html(tab, 0.35)
-    if len(body_text) < 256:
+    if looks_like_hidden_form_intermediate_html(body_text):
         return None
-    lowered = body_text.lower()
-    if challenge_body_score(lowered) >= 4 and len(lowered) <= POST_CHALLENGE_BODY_LIMIT:
-        return None
-    if hidden_form_intermediate_snapshot(tab, request).get("auto"):
-        return None
-    body_bytes = body_text.encode("utf-8", errors="replace")
-    return {
-        "status": 200,
-        "reason": "OK",
-        "headers": {
-            "Content-Type": "text/html; charset=UTF-8",
-            "Cache-Control": "no-store",
-        },
-        "body": body_bytes,
-        "final_url": getattr(tab, "url", "") or request["url"],
-        "title": getattr(tab, "title", ""),
-    }
+    return build_current_html_result(tab, request, body_text, min_body_len=256)
 
 
-def current_document_result(tab, request, timeout_seconds):
+def current_document_result(tab, request, timeout_seconds, allow_challenge=False):
     wait_for_post_challenge(tab, timeout_seconds)
     for _ in range(2):
         wait_for_page_rendered(tab, timeout_seconds)
+        if not can_auto_submit_intermediate(request):
+            break
         if not submit_hidden_form_intermediate(tab, request):
             break
         wait_for_initial_load(tab, timeout_seconds)
     body_text = capture_page_html(tab, timeout_seconds)
-    stop_page_loading(tab)
-    if len(body_text) < 128:
+    initial_snapshot = page_render_snapshot(tab)
+    if is_provisional_browser_document(body_text, initial_snapshot):
+        provisional_resolution = resolve_provisional_document(tab, request, timeout_seconds)
+        if provisional_resolution.get("result") is not None:
+            return provisional_resolution.get("result")
+        if provisional_resolution.get("retry"):
+            return None
+        body_text = provisional_resolution.get("body_text", body_text) or body_text
+    result = build_current_html_result(
+        tab,
+        request,
+        body_text,
+        allow_challenge=allow_challenge,
+        min_body_len=128
+    )
+    if result is None:
         return None
-    lowered = body_text.lower()
-    if challenge_body_score(lowered) >= 4 and len(lowered) <= POST_CHALLENGE_BODY_LIMIT:
+    stop_page_loading(tab)
+    return result
+
+
+def relaxed_document_result(tab, request, timeout_seconds, allow_challenge=False):
+    wait_for_post_challenge(tab, timeout_seconds)
+    wait_for_page_rendered(tab, timeout_seconds)
+    body_text = capture_page_html(tab, max(0.35, min(timeout_seconds, 0.9)))
+    initial_snapshot = page_render_snapshot(tab)
+    if is_provisional_browser_document(body_text, initial_snapshot):
+        provisional_resolution = resolve_provisional_document(tab, request, timeout_seconds)
+        if provisional_resolution.get("result") is not None:
+            return provisional_resolution.get("result")
+        if provisional_resolution.get("retry"):
+            return None
+        body_text = provisional_resolution.get("body_text", body_text) or body_text
+    result = build_current_html_result(
+        tab,
+        request,
+        body_text,
+        allow_challenge=allow_challenge,
+        relaxed=True,
+        min_body_len=48
+    )
+    if result is None:
+        return None
+    stop_page_loading(tab)
+    return result
+
+
+def final_stable_page_result(tab, request, timeout_seconds):
+    try:
+        wait_for_page_rendered(tab, max(0.35, min(timeout_seconds, 0.9)))
+    except Exception:
+        pass
+
+    body_text = capture_page_html(tab, max(0.35, min(timeout_seconds, 0.9)))
+    error_result = browser_error_result(tab, request, body_text)
+    if error_result is not None:
+        stop_page_loading(tab)
+        return error_result
+    result = observed_page_result(
+        tab,
+        request,
+        body_text,
+        min_body_len=48,
+        reject_challenge=True,
+        reject_provisional=False,
+        reject_hidden_form=True
+    )
+    if result is None:
+        return None
+    stop_page_loading(tab)
+    return result
+
+
+def reload_challenge_page_result(tab, request, timeout_seconds):
+    body_text = page_html(tab)
+    if not page_looks_like_challenge(tab, body_text):
+        return None
+    try:
+        reload_page(tab, timeout_seconds)
+        wait_for_page_rendered(tab, timeout_seconds)
+    except Exception:
+        return None
+    result = current_document_result(tab, request, timeout_seconds)
+    if result is not None:
+        return result
+    result = relaxed_document_result(tab, request, timeout_seconds)
+    if result is not None:
+        return result
+    return final_stable_page_result(tab, request, timeout_seconds)
+
+
+def observed_page_result(tab, request, body_text, min_body_len=48,
+                         reject_challenge=True, reject_provisional=False, reject_hidden_form=False):
+    error_result = browser_error_result(tab, request, body_text)
+    if error_result is not None:
+        return error_result
+
+    snapshot = page_render_snapshot(tab)
+    current_tab = resolve_live_tab(tab)
+    final_url = snapshot.get("href", "") or safe_tab_url(tab) or request["url"]
+    title = (snapshot.get("title", "") or getattr(current_tab, "title", "") or "").strip()
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+
+    if not is_http_url(final_url) or is_blank_like_url(final_url):
+        return None
+    if html_len < min_body_len and text_len < 4 and child_count == 0 and not title:
+        return None
+
+    lowered = (body_text or "").lower()
+    if reject_challenge and page_looks_like_challenge(tab, body_text):
+        return None
+    if reject_provisional and is_provisional_browser_document(body_text, snapshot):
+        return None
+    if reject_hidden_form and looks_like_hidden_form_intermediate_html(body_text):
+        return None
+    if reject_hidden_form and hidden_form_intermediate_snapshot(tab, request).get("auto"):
+        return None
+
+    return {
+        "status": 200,
+        "reason": "OK",
+        "headers": {
+            "Content-Type": "text/html; charset=UTF-8",
+            "Cache-Control": "no-store",
+        },
+        "body": (body_text or "").encode("utf-8", errors="replace"),
+        "final_url": final_url,
+        "title": title,
+    }
+
+
+def summarize_tab_state(tab, request, body_text=""):
+    snapshot = page_render_snapshot(tab)
+    current_tab = resolve_live_tab(tab)
+    final_url = snapshot.get("href", "") or safe_tab_url(tab) or request["url"]
+    title = (snapshot.get("title", "") or getattr(current_tab, "title", "") or "").strip()
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    hidden_form = bool(hidden_form_intermediate_snapshot(tab, request).get("auto"))
+    pending = False
+    captured_result = captured_browser_result(tab, request)
+    if captured_result is not None:
+        pending = bool(captured_result.get("navigation_pending"))
+    lowered = (body_text or "").lower()
+    challenge_like = page_looks_like_challenge(tab, body_text)
+    return (
+        f"url={final_url} | title={title[:80]} | html_len={html_len} | text_len={text_len} "
+        f"| child_count={child_count} | hidden_form={hidden_form} | pending={pending} "
+        f"| challenge_like={challenge_like}"
+    )
+
+
+def navigated_page_result(tab, request, body_text):
+    error_result = browser_error_result(tab, request, body_text)
+    if error_result is not None:
+        return error_result
+    if looks_like_hidden_form_intermediate_html(body_text):
+        return None
+
+    snapshot = page_render_snapshot(tab)
+    final_url = snapshot.get("href", "") or safe_tab_url(tab) or request["url"]
+    if not is_http_url(final_url) or is_blank_like_url(final_url):
+        return None
+    if normalized_document_url(final_url) == normalized_document_url(request["url"]):
+        return None
+    result = observed_page_result(
+        tab,
+        request,
+        body_text,
+        min_body_len=48,
+        reject_challenge=True,
+        reject_provisional=False,
+        reject_hidden_form=True
+    )
+    if result is not None:
+        return result
+
+    current_tab = resolve_live_tab(tab)
+    title = (snapshot.get("title", "") or getattr(current_tab, "title", "") or "").strip()
+    html_len = max(int(snapshot.get("html_len", 0) or 0), len(body_text or ""))
+    text_len = int(snapshot.get("text_len", 0) or 0)
+    child_count = int(snapshot.get("child_count", 0) or 0)
+    if html_len < 200 and text_len < 20 and child_count < 4 and not title:
         return None
     if hidden_form_intermediate_snapshot(tab, request).get("auto"):
+        return None
+    lowered = (body_text or "").lower()
+    if page_looks_like_challenge(tab, body_text):
         return None
     return {
         "status": 200,
@@ -1392,10 +2357,177 @@ def current_document_result(tab, request, timeout_seconds):
             "Content-Type": "text/html; charset=UTF-8",
             "Cache-Control": "no-store",
         },
-        "body": body_text.encode("utf-8", errors="replace"),
-        "final_url": getattr(tab, "url", "") or request["url"],
-        "title": getattr(tab, "title", ""),
+        "body": (body_text or "").encode("utf-8", errors="replace"),
+        "final_url": final_url,
+        "title": title,
     }
+
+
+def wait_for_empty_body_navigation_result(tab, request, timeout_seconds):
+    deadline = time.time() + max(1.5, timeout_seconds + 1.2)
+    last_change_at = time.time()
+    state_trace = []
+    original_url = normalized_document_url(request["url"])
+    last_url = normalized_document_url(safe_tab_url(tab))
+    next_body_probe_at = time.time()
+    hidden_form_seen_at = None
+    hidden_form_submitted = False
+
+    while time.time() < deadline:
+        captured_result = captured_browser_result(tab, request)
+        if captured_result is not None:
+            if not captured_result.get("navigation_pending") and not is_post_challenge_result(captured_result):
+                return captured_result
+            last_change_at = time.time()
+
+        current_url = normalized_document_url(safe_tab_url(tab))
+        if current_url != last_url:
+            last_url = current_url
+            last_change_at = time.time()
+            next_body_probe_at = time.time()
+
+        should_probe_body = time.time() >= next_body_probe_at
+        navigated_away = current_url and current_url != original_url and is_http_url(current_url) and not is_blank_like_url(current_url)
+
+        if navigated_away:
+            should_probe_body = True
+
+        if should_probe_body:
+            body_text = capture_page_html(tab, 0.2 if not navigated_away else 0.35)
+            state_trace.append(summarize_tab_state(tab, request, body_text))
+            if len(state_trace) > 10:
+                state_trace.pop(0)
+            next_body_probe_at = time.time() + (0.18 if navigated_away else 0.4)
+
+            intermediate_snapshot = hidden_form_intermediate_snapshot(tab, request)
+            if intermediate_snapshot.get("auto"):
+                if hidden_form_seen_at is None:
+                    hidden_form_seen_at = time.time()
+                elif (not hidden_form_submitted
+                      and time.time() - hidden_form_seen_at >= EMPTY_BODY_HIDDEN_FORM_STABLE_SECONDS):
+                    if submit_hidden_form_intermediate(tab, request):
+                        hidden_form_submitted = True
+                        hidden_form_seen_at = None
+                        last_change_at = time.time()
+                        try:
+                            wait_for_initial_load(tab, max(0.8, min(timeout_seconds, 2.0)))
+                        except Exception:
+                            pass
+                        continue
+            else:
+                hidden_form_seen_at = None
+
+            navigated_result = navigated_page_result(tab, request, body_text)
+            if navigated_result is not None and time.time() - last_change_at >= EMPTY_BODY_SETTLE_SECONDS:
+                stop_page_loading(tab)
+                return navigated_result
+
+            result = observed_page_result(
+                tab,
+                request,
+                body_text,
+                min_body_len=48,
+                reject_challenge=True,
+                reject_provisional=False,
+                reject_hidden_form=True
+            )
+            if result is not None and time.time() - last_change_at >= EMPTY_BODY_SETTLE_SECONDS:
+                stop_page_loading(tab)
+                return result
+
+        time.sleep(GET_POLL_INTERVAL_SECONDS)
+
+    final_result = final_stable_page_result(tab, request, max(0.35, min(timeout_seconds, 1.2)))
+    if final_result is not None and not hidden_form_intermediate_snapshot(tab, request).get("auto"):
+        return final_result
+    body_text = page_html(tab)
+    navigated_result = navigated_page_result(tab, request, body_text)
+    if navigated_result is not None:
+        return navigated_result
+    return {
+        "error": "navigation post did not produce a stable browser result",
+        "trace": state_trace,
+        "final_state": summarize_tab_state(tab, request, body_text),
+    }
+
+
+def complete_navigation_post_challenge(tab, request, timeout_seconds):
+    wait_for_post_challenge(tab, timeout_seconds)
+
+    submitted_intermediate = False
+    if can_auto_submit_challenge_intermediate(request):
+        submitted_intermediate = submit_hidden_form_intermediate(tab, request)
+    if submitted_intermediate:
+        wait_for_initial_load(tab, timeout_seconds)
+        navigation_result = current_document_result(tab, request, timeout_seconds)
+        if navigation_result is not None:
+            return navigation_result
+
+    captured_result = wait_for_captured_browser_result(tab, request, timeout_seconds)
+    if captured_result is not None:
+        if captured_result.get("navigation_pending"):
+            navigation_result = current_document_result(tab, request, timeout_seconds)
+            if navigation_result is not None:
+                return navigation_result
+        elif not is_post_challenge_result(captured_result):
+            return captured_result
+
+    page_result = current_page_result(tab, request)
+    if page_result is not None:
+        return page_result
+
+    relaxed_result = relaxed_document_result(tab, request, timeout_seconds)
+    if relaxed_result is not None:
+        return relaxed_result
+
+    blank_snapshot = page_render_snapshot(tab)
+    if is_blank_like_snapshot(blank_snapshot):
+        navigation_result = current_document_result(tab, request, timeout_seconds)
+        if navigation_result is not None:
+            return navigation_result
+        page_result = current_page_result(tab, request)
+        if page_result is not None:
+            return page_result
+        relaxed_result = relaxed_document_result(tab, request, timeout_seconds)
+        if relaxed_result is not None:
+            return relaxed_result
+
+    page_result = current_page_result(tab, request)
+    if page_result is not None:
+        return page_result
+    relaxed_result = relaxed_document_result(tab, request, timeout_seconds)
+    if relaxed_result is not None:
+        return relaxed_result
+    final_result = final_stable_page_result(tab, request, timeout_seconds)
+    if final_result is not None:
+        return final_result
+    reload_result = reload_challenge_page_result(tab, request, timeout_seconds)
+    if reload_result is not None:
+        return reload_result
+    return None
+
+
+def execute_navigation_non_form_post_request(tab, request, timeout_seconds, allow_static_resources):
+    configure_tab_network(tab, allow_static_resources)
+    ensure_post_context(tab, request, timeout_seconds)
+    set_request_cookies(tab, request)
+
+    initial_result = execute_fetch_post_request(tab, request)
+    if not is_post_challenge_result(initial_result):
+        return initial_result
+
+    load_challenge_page(tab, request, initial_result, timeout_seconds)
+    challenge_result = complete_navigation_post_challenge(tab, request, timeout_seconds)
+    if challenge_result is not None:
+        return challenge_result
+
+    page_result = current_page_result(tab, request)
+    if page_result is not None:
+        return page_result
+    final_result = final_stable_page_result(tab, request, timeout_seconds)
+    if final_result is not None:
+        return final_result
+    return initial_result
 
 
 def execute_navigation_post_request(tab, request, timeout_seconds):
@@ -1403,6 +2535,15 @@ def execute_navigation_post_request(tab, request, timeout_seconds):
     set_request_cookies(tab, request)
     if is_empty_body_post(request):
         submit_empty_post_request(tab, request)
+        wait_for_initial_load(tab, timeout_seconds)
+        result = wait_for_empty_body_navigation_result(tab, request, timeout_seconds)
+        if result is not None:
+            if isinstance(result, dict) and result.get("error"):
+                trace = " || ".join(result.get("trace") or [])
+                final_state = result.get("final_state") or ""
+                raise RuntimeError(f"{result['error']} | final_state={final_state} | trace={trace}")
+            return result
+        raise RuntimeError("navigation post did not produce a stable browser result")
     elif is_form_urlencoded_post(request):
         submit_form_post_request(tab, request)
     else:
@@ -1411,14 +2552,30 @@ def execute_navigation_post_request(tab, request, timeout_seconds):
     result = current_document_result(tab, request, timeout_seconds)
     if result is not None:
         return result
-    return execute_fetch_post_request(tab, request)
+    challenge_result = complete_navigation_post_challenge(tab, request, timeout_seconds)
+    if challenge_result is not None:
+        return challenge_result
+    relaxed_result = relaxed_document_result(tab, request, timeout_seconds)
+    if relaxed_result is not None:
+        return relaxed_result
+    final_result = final_stable_page_result(tab, request, timeout_seconds)
+    if final_result is not None:
+        return final_result
+    reload_result = reload_challenge_page_result(tab, request, timeout_seconds)
+    if reload_result is not None:
+        return reload_result
+    raise RuntimeError("navigation post did not produce a stable browser result | final_state="
+                       + summarize_tab_state(tab, request, page_html(tab)))
 
 
 def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
-    configure_tab_network(tab, allow_static_resources)
     if is_navigation_post(request) and can_submit_as_navigation_post(request):
+        configure_tab_network(tab, allow_static_resources)
         return execute_navigation_post_request(tab, request, timeout_seconds)
+    if is_navigation_non_form_post(request):
+        return execute_navigation_non_form_post_request(tab, request, timeout_seconds, allow_static_resources)
 
+    configure_tab_network(tab, allow_static_resources)
     ensure_post_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
     result = execute_fetch_post_request(tab, request)
@@ -1427,25 +2584,16 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
 
     last_result = result
     for _ in range(POST_RETRY_ATTEMPTS):
-        load_challenge_page(tab, request, last_result)
+        load_challenge_page(tab, request, last_result, timeout_seconds)
+        if is_navigation_post(request):
+            navigation_result = complete_navigation_post_challenge(tab, request, timeout_seconds)
+            if navigation_result is not None:
+                return navigation_result
+            return last_result
         wait_for_post_challenge(tab, timeout_seconds)
-        if submit_hidden_form_intermediate(tab, request):
-            wait_for_initial_load(tab, timeout_seconds)
         captured_result = wait_for_captured_browser_result(tab, request, timeout_seconds)
         if captured_result is not None and not is_post_challenge_result(captured_result):
             return captured_result
-        if is_navigation_post(request) and can_submit_as_navigation_post(request):
-            ensure_post_context(tab, request, timeout_seconds)
-            if is_empty_body_post(request):
-                submit_empty_post_request(tab, request)
-            elif is_form_urlencoded_post(request):
-                submit_form_post_request(tab, request)
-            else:
-                submit_multipart_post_request(tab, request)
-            wait_for_initial_load(tab, timeout_seconds)
-            navigation_result = current_document_result(tab, request, timeout_seconds)
-            if navigation_result is not None:
-                return navigation_result
         page_result = current_page_result(tab, request)
         if page_result is not None:
             return page_result
@@ -1463,13 +2611,14 @@ def execute_get_request(tab, request, timeout_seconds, allow_static_resources):
     if not is_navigation_get(request):
         ensure_fetch_context(tab, request, timeout_seconds)
         return execute_fetch_get_request(tab, request)
-    tab.get(request["url"], retry=0, interval=0, timeout=timeout_seconds)
-    wait_for_initial_load(tab, timeout_seconds)
+    current_tab = resolve_live_tab(tab)
+    current_tab.get(request["url"], retry=0, interval=0, timeout=timeout_seconds)
+    wait_for_initial_load(current_tab, timeout_seconds)
     # Some anti-bot pages only render the final document after one real reload.
-    reload_page(tab, timeout_seconds)
-    wait_for_page_rendered(tab, timeout_seconds)
-    body_text = capture_page_html(tab, timeout_seconds)
-    stop_page_loading(tab)
+    reload_page(current_tab, timeout_seconds)
+    wait_for_page_rendered(current_tab, timeout_seconds)
+    body_text = capture_page_html(current_tab, timeout_seconds)
+    stop_page_loading(current_tab)
     body_bytes = body_text.encode("utf-8", errors="replace")
     return {
         "status": 200,
@@ -1479,8 +2628,8 @@ def execute_get_request(tab, request, timeout_seconds, allow_static_resources):
             "Cache-Control": "no-store",
         },
         "body": body_bytes,
-        "final_url": getattr(tab, "url", "") or request["url"],
-        "title": getattr(tab, "title", ""),
+        "final_url": safe_tab_url(current_tab) or request["url"],
+        "title": getattr(current_tab, "title", ""),
     }
 
 
@@ -1489,16 +2638,36 @@ def close_browser(args):
     for port in candidate_existing_ports(args):
         try:
             browser = Chromium(build_options(args, port, existing_only=True))
+            restore_browser_hooks(browser)
             try:
                 browser.quit(3, force=True)
             except TypeError:
-                browser.quit()
+                try:
+                    browser.quit()
+                except Exception:
+                    pass
+            except Exception:
+                pass
             clear_state(args.state_file)
             return
         except Exception as exc:
             last_error = exc
     clear_state(args.state_file)
     if last_error is not None and candidate_existing_ports(args):
+        raise last_error
+
+
+def cleanup_browser(args):
+    last_error = None
+    cleaned = False
+    for port in candidate_existing_ports(args):
+        try:
+            browser = Chromium(build_options(args, port, existing_only=True))
+            restore_browser_hooks(browser)
+            cleaned = True
+        except Exception as exc:
+            last_error = exc
+    if not cleaned and last_error is not None and candidate_existing_ports(args):
         raise last_error
 
 
@@ -1560,7 +2729,7 @@ def navigate(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--action", choices=("navigate", "close"), required=True)
+    parser.add_argument("--action", choices=("navigate", "close", "cleanup"), required=True)
     parser.add_argument("--request-file", default="")
     parser.add_argument("--browser-type", default="edge")
     parser.add_argument("--browser-path", default="")
@@ -1580,11 +2749,21 @@ def main():
             print(f"TITLE={b64_text('')}")
             print("HEADER_COUNT=0")
             print("BODY=")
+        elif args.action == "cleanup":
+            cleanup_browser(args)
+            print("STATUS=0")
+            print(f"REASON={b64_text('')}")
+            print(f"FINAL_URL={b64_text('')}")
+            print(f"TITLE={b64_text('')}")
+            print("HEADER_COUNT=0")
+            print("BODY=")
         else:
             navigate(args)
         return 0
     except Exception as exc:
-        print(str(exc), file=sys.stderr)
+        message = str(exc) or repr(exc) or exc.__class__.__name__
+        print(message, file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
         return 1
 
 

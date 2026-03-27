@@ -1,8 +1,14 @@
 # PassRS
 #兼容性问题与若干bug正在修复..请关注之后版本
+
 PassRS is a Burp Suite extension that relays selected Burp requests into a real browser context, then returns the browser-side result back to Burp.
 
 It is designed for targets where normal Burp replay is blocked by frontend anti-replay, anti-bot, challenge pages, dynamic cookies, or browser-context-dependent request flows.
+
+## Author
+
+- Author: `Zmz-c`
+- GitHub: `https://github.com/Zmz-c/PassRS`
 
 ## What It Does
 
@@ -27,11 +33,22 @@ This is useful when:
 - Scope filtering: all / in-scope / out-of-scope
 - Target host or IP regex matching
 - GET and POST handling with browser-context execution
+- Compatibility for empty-body POST, raw-body POST, and non-standard navigation POST payloads
 - Challenge-page follow-up handling
 - Optional static resource loading control
 - Browser reuse to reduce repeated launches
 - Auto-save configuration in the extension UI
 - Local HTTPS relay for Burp-to-browser bridging
+
+## Request Compatibility
+
+PassRS currently distinguishes browser replay paths conservatively to avoid rewriting requests into the wrong format:
+
+- Empty-body `POST`
+- Standard `application/x-www-form-urlencoded`
+- Non-standard `application/x-www-form-urlencoded` payloads that should stay as raw body
+- `multipart/form-data` when form fields can be reconstructed safely
+- Raw-body navigation `POST` such as JSON, text, and other browser-side payloads
 
 ## Workflow
 

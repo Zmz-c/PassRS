@@ -11,6 +11,8 @@ import passrs.relay.LocalRelayServer;
 import passrs.ui.PassRsPanel;
 
 public final class PassRsExtension implements BurpExtension, ExtensionUnloadingHandler {
+    private static final String AUTHOR_NAME = "Zmz-c";
+    private static final String REPOSITORY_URL = "https://github.com/Zmz-c/PassRS";
 
     private PassRsPanel panel;
     private GlobalBrowserHttpHandler httpHandler;
@@ -39,7 +41,7 @@ public final class PassRsExtension implements BurpExtension, ExtensionUnloadingH
         api.userInterface().registerSuiteTab("PassRS", panel.uiComponent());
         httpHandlerRegistration = api.http().registerHttpHandler(httpHandler);
         api.extension().registerUnloadingHandler(this);
-        api.logging().raiseInfoEvent("PassRS loaded");
+        api.logging().raiseInfoEvent("PassRS loaded | Author: " + AUTHOR_NAME + " | Repo: " + REPOSITORY_URL);
     }
 
     @Override

@@ -43,6 +43,8 @@ import java.util.Map;
 import java.util.Set;
 
 public final class PassRsPanel {
+    private static final String AUTHOR_NAME = "Zmz-c";
+    private static final String REPOSITORY_URL = "https://github.com/Zmz-c/PassRS";
 
     private final MontoyaApi api;
     private final ExtensionConfig config;
@@ -137,8 +139,19 @@ public final class PassRsPanel {
         subtitle.setOpaque(false);
         subtitle.setFont(subtitle.getFont().deriveFont(subtitle.getFont().getSize2D() + 1f));
 
+        JTextArea meta = new JTextArea(
+                "Author: " + AUTHOR_NAME + "\n" +
+                        "GitHub: " + REPOSITORY_URL
+        );
+        meta.setEditable(false);
+        meta.setOpaque(false);
+        meta.setLineWrap(true);
+        meta.setWrapStyleWord(true);
+        meta.setFont(meta.getFont().deriveFont(meta.getFont().getSize2D() - 0.5f));
+
         panel.add(title, BorderLayout.NORTH);
         panel.add(subtitle, BorderLayout.CENTER);
+        panel.add(meta, BorderLayout.SOUTH);
         return panel;
     }
 
@@ -358,10 +371,40 @@ public final class PassRsPanel {
     }
 
     private ExtensionConfig.Snapshot saveConfig(boolean showSuccessDialog, boolean showErrorDialog) {
+        ParsedConfigValues values = parseStrictConfigValues(showErrorDialog);
+        if (values == null) {
+            return null;
+        }
+        ExtensionConfig.Snapshot snapshot = persistConfig(values.timeoutMs(), values.targetHostRegex());
+        if (showSuccessDialog) {
+            JOptionPane.showMessageDialog(root, "Configuration saved.", "PassRS", JOptionPane.INFORMATION_MESSAGE);
+        }
+        return snapshot;
+    }
+
+    private SaveOutcome saveConfigLenient() {
+        ExtensionConfig.Snapshot previous = config.snapshot();
+        ParsedConfigValues values = parseConfigValues(false, false, previous);
+        if (values == null) {
+            return new SaveOutcome(null, "Configuration not saved");
+        }
+        ExtensionConfig.Snapshot snapshot = persistConfig(values.timeoutMs(), values.targetHostRegex());
+        return new SaveOutcome(snapshot, values.warningMessage());
+    }
+
+    private ParsedConfigValues parseStrictConfigValues(boolean showErrorDialog) {
         long timeoutMs;
         try {
             timeoutMs = Long.parseLong(timeoutField.getText().trim());
         } catch (NumberFormatException e) {
+            if (showErrorDialog) {
+                showError("Timeout must be a number between 1000 and 300000.");
+            } else {
+                setStatus("Configuration not saved: invalid timeout");
+            }
+            return null;
+        }
+        if (timeoutMs < 1000L || timeoutMs > 300000L) {
             if (showErrorDialog) {
                 showError("Timeout must be a number between 1000 and 300000.");
             } else {
@@ -383,8 +426,66 @@ public final class PassRsPanel {
                 return null;
             }
         }
+        return new ParsedConfigValues(timeoutMs, targetHostRegex, "");
+    }
 
-        ExtensionConfig.Snapshot snapshot = config.save(
+    private ParsedConfigValues parseConfigValues(boolean strictTimeoutValidation, boolean strictRegexValidation,
+                                                 ExtensionConfig.Snapshot fallbackSnapshot) {
+        long timeoutMs;
+        try {
+            timeoutMs = Long.parseLong(timeoutField.getText().trim());
+        } catch (NumberFormatException e) {
+            if (strictTimeoutValidation) {
+                showError("Timeout must be a number between 1000 and 300000.");
+                return null;
+            }
+            timeoutMs = fallbackSnapshot.timeoutMs();
+        }
+        if (timeoutMs < 1000L || timeoutMs > 300000L) {
+            if (strictTimeoutValidation) {
+                showError("Timeout must be a number between 1000 and 300000.");
+                return null;
+            }
+            timeoutMs = fallbackSnapshot.timeoutMs();
+        }
+
+        String targetHostRegex = targetHostRegexField.getText() == null ? "" : targetHostRegexField.getText().trim();
+        if (!targetHostRegex.isEmpty()) {
+            try {
+                Pattern.compile(targetHostRegex);
+            } catch (PatternSyntaxException e) {
+                if (strictRegexValidation) {
+                    showError("Target Regex is invalid: " + e.getDescription());
+                    return null;
+                }
+                targetHostRegex = fallbackSnapshot.targetHostRegex();
+            }
+        }
+        String warningMessage = buildConfigWarningMessage(timeoutMs, targetHostRegex, fallbackSnapshot);
+        return new ParsedConfigValues(timeoutMs, targetHostRegex, warningMessage);
+    }
+
+    private String buildConfigWarningMessage(long timeoutMs, String targetHostRegex,
+                                             ExtensionConfig.Snapshot fallbackSnapshot) {
+        boolean timeoutFallback = timeoutMs == fallbackSnapshot.timeoutMs()
+                && !timeoutField.getText().trim().equals(String.valueOf(timeoutMs));
+        boolean regexFallback = !targetHostRegex.equals(targetHostRegexField.getText() == null
+                ? ""
+                : targetHostRegexField.getText().trim());
+        if (timeoutFallback && regexFallback) {
+            return "Applied hook settings; invalid timeout and regex kept previous values";
+        }
+        if (timeoutFallback) {
+            return "Applied hook settings; invalid timeout kept previous value";
+        }
+        if (regexFallback) {
+            return "Applied hook settings; invalid regex kept previous value";
+        }
+        return "";
+    }
+
+    private ExtensionConfig.Snapshot persistConfig(long timeoutMs, String targetHostRegex) {
+        return config.save(
                 enabledCheckBox.isSelected(),
                 "Chrome".equals(browserTypeCombo.getSelectedItem()) ? "chrome" : "edge",
                 browserPathField.getText(),
@@ -395,23 +496,19 @@ public final class PassRsPanel {
                 loadStaticResourcesCheckBox.isSelected(),
                 targetHostRegex
         );
-        if (showSuccessDialog) {
-            JOptionPane.showMessageDialog(root, "Configuration saved.", "PassRS", JOptionPane.INFORMATION_MESSAGE);
-        }
-        return snapshot;
     }
 
     private void installAutoSave() {
-        enabledCheckBox.addActionListener(e -> scheduleAutoSave());
-        browserTypeCombo.addActionListener(e -> scheduleAutoSave());
-        scopeModeCombo.addActionListener(e -> scheduleAutoSave());
-        loadStaticResourcesCheckBox.addActionListener(e -> scheduleAutoSave());
+        enabledCheckBox.addActionListener(e -> applyConfigImmediately());
+        browserTypeCombo.addActionListener(e -> applyConfigImmediately());
+        scopeModeCombo.addActionListener(e -> applyConfigImmediately());
+        loadStaticResourcesCheckBox.addActionListener(e -> applyConfigImmediately());
         installAutoSave(browserPathField);
         installAutoSave(pythonPathField);
         installAutoSave(timeoutField);
         installAutoSave(targetHostRegexField);
         for (JCheckBox checkBox : toolCheckBoxes.values()) {
-            checkBox.addActionListener(e -> scheduleAutoSave());
+            checkBox.addActionListener(e -> applyConfigImmediately());
         }
     }
 
@@ -452,6 +549,34 @@ public final class PassRsPanel {
         if (previous.enabled() && !snapshot.enabled()) {
             closeBrowserAsync(snapshot, "Relay disabled, closing browser");
         }
+    }
+
+    private void applyConfigImmediately() {
+        if (loadingConfig) {
+            return;
+        }
+        autoSaveTimer.stop();
+        ExtensionConfig.Snapshot previous = config.snapshot();
+        SaveOutcome outcome = saveConfigLenient();
+        ExtensionConfig.Snapshot snapshot = outcome.snapshot();
+        if (snapshot == null) {
+            return;
+        }
+        refreshRuntime(snapshot);
+        if (!outcome.warningMessage().isBlank()) {
+            setStatus(outcome.warningMessage());
+        } else {
+            setStatus(snapshot.enabled() ? "Configuration applied" : "Relay hook disabled");
+        }
+        if (previous.enabled() && !snapshot.enabled()) {
+            closeBrowserAsync(snapshot, "Relay disabled, closing browser");
+        }
+    }
+
+    private record ParsedConfigValues(long timeoutMs, String targetHostRegex, String warningMessage) {
+    }
+
+    private record SaveOutcome(ExtensionConfig.Snapshot snapshot, String warningMessage) {
     }
 
     private File resolveSelectedPath(String text) {

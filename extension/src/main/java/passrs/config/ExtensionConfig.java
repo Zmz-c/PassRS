@@ -26,23 +26,15 @@ public final class ExtensionConfig {
     private static final ScopeMode DEFAULT_SCOPE_MODE = ScopeMode.ALL;
 
     private final Preferences preferences;
+    private volatile Snapshot currentSnapshot;
 
     public ExtensionConfig(Preferences preferences) {
         this.preferences = preferences;
+        this.currentSnapshot = loadSnapshotFromPreferences();
     }
 
     public synchronized Snapshot snapshot() {
-        boolean enabled = preferences.getBoolean(KEY_ENABLED) == null || preferences.getBoolean(KEY_ENABLED);
-        String browserType = sanitizeBrowserType(preferences.getString(KEY_BROWSER_TYPE));
-        String browserPath = trimToEmpty(preferences.getString(KEY_BROWSER_PATH));
-        String pythonPath = trimToEmpty(preferences.getString(KEY_PYTHON_PATH));
-        long timeoutMs = sanitizeTimeout(preferences.getLong(KEY_TIMEOUT_MS));
-        ScopeMode scopeMode = sanitizeScopeMode(preferences.getString(KEY_SCOPE_MODE));
-        Set<ToolType> toolTypes = sanitizeToolTypes(preferences.getString(KEY_TOOL_TYPES));
-        boolean loadStaticResources = Boolean.TRUE.equals(preferences.getBoolean(KEY_LOAD_STATIC_RESOURCES));
-        String targetHostRegex = trimToEmpty(preferences.getString(KEY_TARGET_HOST_REGEX));
-        return new Snapshot(enabled, browserType, browserPath, pythonPath, timeoutMs, scopeMode,
-                toolTypes, loadStaticResources, targetHostRegex);
+        return currentSnapshot;
     }
 
     public synchronized Snapshot save(boolean enabled, String browserType, String browserPath, String pythonPath,
@@ -59,6 +51,7 @@ public final class ExtensionConfig {
                 loadStaticResources,
                 trimToEmpty(targetHostRegex)
         );
+        currentSnapshot = snapshot;
         preferences.setBoolean(KEY_ENABLED, snapshot.enabled());
         preferences.setString(KEY_BROWSER_TYPE, snapshot.browserType());
         preferences.setString(KEY_BROWSER_PATH, snapshot.browserPath());
@@ -69,6 +62,20 @@ public final class ExtensionConfig {
         preferences.setBoolean(KEY_LOAD_STATIC_RESOURCES, snapshot.loadStaticResources());
         preferences.setString(KEY_TARGET_HOST_REGEX, snapshot.targetHostRegex());
         return snapshot;
+    }
+
+    private Snapshot loadSnapshotFromPreferences() {
+        boolean enabled = preferences.getBoolean(KEY_ENABLED) == null || preferences.getBoolean(KEY_ENABLED);
+        String browserType = sanitizeBrowserType(preferences.getString(KEY_BROWSER_TYPE));
+        String browserPath = trimToEmpty(preferences.getString(KEY_BROWSER_PATH));
+        String pythonPath = trimToEmpty(preferences.getString(KEY_PYTHON_PATH));
+        long timeoutMs = sanitizeTimeout(preferences.getLong(KEY_TIMEOUT_MS));
+        ScopeMode scopeMode = sanitizeScopeMode(preferences.getString(KEY_SCOPE_MODE));
+        Set<ToolType> toolTypes = sanitizeToolTypes(preferences.getString(KEY_TOOL_TYPES));
+        boolean loadStaticResources = Boolean.TRUE.equals(preferences.getBoolean(KEY_LOAD_STATIC_RESOURCES));
+        String targetHostRegex = trimToEmpty(preferences.getString(KEY_TARGET_HOST_REGEX));
+        return new Snapshot(enabled, browserType, browserPath, pythonPath, timeoutMs, scopeMode,
+                toolTypes, loadStaticResources, targetHostRegex);
     }
 
     private String sanitizeBrowserType(String browserType) {

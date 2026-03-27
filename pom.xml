@@ -18,7 +18,7 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <burp.api.version>2026.2</burp.api.version>
-        <plugin.version>1.0.0</plugin.version>
+        <plugin.version>1.0.1</plugin.version>
         <undertow.version>2.3.18.Final</undertow.version>
     </properties>
 </project>
