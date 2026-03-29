@@ -1,5 +1,6 @@
 # PassRS
-#兼容性问题与若干bug正在修复..请关注之后版本
+
+[中文说明 / README.zh-CN](README.zh-CN.md)
 
 PassRS is a Burp Suite extension that relays selected Burp requests into a real browser context, then returns the browser-side result back to Burp.
 
