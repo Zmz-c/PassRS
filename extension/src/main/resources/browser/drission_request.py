@@ -2,12 +2,16 @@ import argparse
 import base64
 import json
 import os
+import quopri
 import re
 import socket
+import ssl
 import sys
 import time
 import traceback
-from urllib.parse import parse_qsl, urlparse
+import urllib.error
+import urllib.request
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 
 from DrissionPage import Chromium, ChromiumOptions
 
@@ -49,6 +53,8 @@ BLOCKED_RESOURCE_PATTERNS = [
     "*.webm",
     "*.m4a",
 ]
+FORM_NAVIGATION_METHODS = {"GET", "POST"}
+SCRIPT_FRIENDLY_FETCH_MODES = {"cors", "no-cors", "same-origin"}
 
 
 def load_state(state_file):
@@ -443,6 +449,260 @@ def configure_tab_network(tab, allow_static_resources):
             pass
 
 
+def managed_request_headers(request):
+    if request_method(request) not in ("GET", "POST"):
+        return {}
+    if request_method(request) == "GET" and not is_navigation_get(request):
+        return {}
+    if request_method(request) == "POST" and not is_navigation_post(request):
+        return {}
+    headers = {}
+    for name, value in parse_headers(request["headers"]):
+        lower = name.lower()
+        if lower in ("host", "content-length", "connection", "cookie"):
+            continue
+        if lower.startswith("proxy-"):
+            continue
+        if lower in (
+            "origin",
+            "referer",
+            "upgrade-insecure-requests",
+        ):
+            headers[name] = value
+    return headers
+
+
+def apply_managed_request_headers(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return
+    headers = managed_request_headers(request)
+    if not headers:
+        return False
+    try:
+        current_tab.run_cdp("Network.setExtraHTTPHeaders", headers=headers)
+        return True
+    except Exception:
+        return False
+
+
+def clear_managed_request_headers(tab):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return
+    try:
+        current_tab.run_cdp("Network.setExtraHTTPHeaders", headers={})
+    except Exception:
+        pass
+
+
+def packet_header_lines(packet):
+    response = packet_response(packet)
+    headers = getattr(response, "headers", None)
+    result = []
+    if hasattr(headers, "items"):
+        for name, value in headers.items():
+            result.append(f"{str(name).strip()}: {str(value).strip()}")
+    return result
+
+
+def packet_request_method(packet):
+    request = getattr(packet, "request", None)
+    for attr_name in ("method", "request_method"):
+        value = getattr(request, attr_name, None)
+        if value:
+            return str(value).upper()
+    return ""
+
+
+def packet_url(packet):
+    for candidate in (
+        getattr(packet, "url", None),
+        getattr(getattr(packet, "request", None), "url", None),
+        getattr(packet_response(packet), "url", None),
+    ):
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def packet_matches_request(packet, request):
+    if packet is None:
+        return False
+    packet_method = packet_request_method(packet)
+    if packet_method and packet_method != request_method(request):
+        return False
+    packet_target_url = packet_url(packet)
+    if not packet_target_url:
+        return True
+    return packet_target_url == request["url"] or packet_target_url.startswith(request["url"])
+
+
+def packet_has_response(packet):
+    return packet_status(packet) > 0
+
+
+def packet_final_url(packet, request):
+    for candidate in (
+        getattr(packet, "url", None),
+        getattr(packet_response(packet), "url", None),
+        request["url"],
+    ):
+        if candidate:
+            return str(candidate)
+    return request["url"]
+
+
+def packet_reason(packet):
+    response = packet_response(packet)
+    for attr_name in ("statusText", "reason", "status_text"):
+        value = getattr(response, attr_name, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def head_result_from_observed_packet(packet, request):
+    status = packet_status(packet)
+    if status <= 0:
+        return None
+    headers = packet_header_lines(packet)
+    return {
+        "status": status,
+        "reason": packet_reason(packet),
+        "headers": headers,
+        "body": b"",
+        "final_url": packet_final_url(packet, request),
+        "content_type": response_header_value_from_lines(headers, "Content-Type"),
+        "title": "",
+    }
+
+
+def observed_result_from_packet(packet, request):
+    status = packet_status(packet)
+    if status <= 0:
+        return None
+    headers = packet_header_lines(packet)
+    headers.append("X-PassRS-Observed-Body-Unavailable: true")
+    return {
+        "status": status,
+        "reason": packet_reason(packet),
+        "headers": headers,
+        "body": b"",
+        "final_url": packet_final_url(packet, request),
+        "content_type": response_header_value_from_lines(headers, "Content-Type"),
+        "title": "",
+    }
+
+
+def python_fallback_request_headers(request):
+    headers = {}
+    for name, value in parse_headers(request["headers"]):
+        lower = name.lower()
+        if lower in ("host", "content-length", "connection", "proxy-connection"):
+            continue
+        if lower.startswith("proxy-"):
+            continue
+        headers[name] = value
+    return headers
+
+
+def execute_python_head_request(request, timeout_seconds):
+    request_headers = python_fallback_request_headers(request)
+    timeout = max(float(timeout_seconds), 5.0)
+    ssl_context = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(context=ssl_context),
+        urllib.request.HTTPRedirectHandler(),
+    )
+    urllib_request = urllib.request.Request(
+        request["url"],
+        headers=request_headers,
+        method="HEAD",
+    )
+    try:
+        with opener.open(urllib_request, timeout=timeout) as response:
+            headers = [f"{name}: {value}" for name, value in response.headers.items()]
+            headers.append("X-PassRS-Fallback: python-head")
+            return {
+                "status": int(getattr(response, "status", 0) or 0),
+                "reason": getattr(response, "reason", "") or "",
+                "headers": headers,
+                "body": b"",
+                "final_url": getattr(response, "geturl", lambda: request["url"])() or request["url"],
+                "content_type": response.headers.get("Content-Type", ""),
+                "title": "",
+            }
+    except urllib.error.HTTPError as exc:
+        headers = [f"{name}: {value}" for name, value in exc.headers.items()]
+        headers.append("X-PassRS-Fallback: python-head")
+        return {
+            "status": int(getattr(exc, "code", 0) or 0),
+            "reason": getattr(exc, "reason", "") or "",
+            "headers": headers,
+            "body": b"",
+            "final_url": getattr(exc, "geturl", lambda: request["url"])() or request["url"],
+            "content_type": exc.headers.get("Content-Type", ""),
+            "title": "",
+        }
+
+
+def execute_browser_head_probe(tab, request):
+    headers = allowed_script_headers(request)
+    script = """
+(async () => {
+    const url = __URL__;
+    const headers = __HEADERS__;
+    const referrer = __REFERRER__;
+    try {
+        const response = await fetch(url, {
+            method: 'HEAD',
+            mode: 'no-cors',
+            credentials: 'include',
+            cache: 'no-store',
+            redirect: 'follow',
+            referrer: referrer || undefined,
+            headers,
+        });
+        return JSON.stringify({
+            status: Number(response && response.status || 0),
+            reason: String(response && response.statusText || ''),
+            headers: '',
+            body_base64: '',
+            final_url: String(response && response.url || url),
+            opaque: !!(response && response.type === 'opaque'),
+        });
+    } catch (e) {
+        return JSON.stringify({error: String(e)});
+    }
+})();
+"""
+    script = script.replace("__URL__", json.dumps(request["url"]))
+    script = script.replace("__HEADERS__", json.dumps(headers, ensure_ascii=False))
+    script = script.replace("__REFERRER__", json.dumps(header_value(request, "Referer")))
+    try:
+        return parse_script_response(tab, evaluate_async_json(tab, script), request)
+    except Exception:
+        return None
+
+
+def execute_head_request(tab, request, timeout_seconds, allow_static_resources):
+    configure_tab_network(tab, allow_static_resources)
+    ensure_fetch_context(tab, request, timeout_seconds)
+    set_request_cookies(tab, request)
+
+    execute_browser_head_probe(tab, request)
+
+    packet = wait_for_observed_request_packet(tab, request, min(timeout_seconds, 2.0), require_response=True)
+    packet_result = head_result_from_observed_packet(packet, request)
+    if packet_result is not None:
+        packet_result["headers"] = result_header_lines(packet_result) + ["X-PassRS-Fallback: browser-head-probe"]
+        return packet_result
+
+    return execute_python_head_request(request, timeout_seconds)
+
+
 def parse_headers(header_lines):
     result = []
     for line in header_lines:
@@ -465,6 +725,18 @@ def request_content_type(request):
     return header_value(request, "Content-Type").lower()
 
 
+def request_method(request):
+    return (request.get("method") or "").upper()
+
+
+def method_allows_request_body(method):
+    return (method or "").upper() not in ("GET", "HEAD")
+
+
+def is_form_navigation_method(request):
+    return request_method(request) in FORM_NAVIGATION_METHODS
+
+
 def request_accepts_html(request):
     accept = header_value(request, "Accept").lower()
     return "text/html" in accept or "application/xhtml+xml" in accept
@@ -483,6 +755,8 @@ def is_navigation_get(request):
 
 
 def is_navigation_post(request):
+    if request_method(request) != "POST":
+        return False
     fetch_mode = header_value(request, "Sec-Fetch-Mode").lower()
     fetch_dest = header_value(request, "Sec-Fetch-Dest").lower()
     if fetch_mode == "navigate":
@@ -503,17 +777,24 @@ def is_multipart_form_post(request):
 
 
 def request_has_body(request):
-    return bool(request.get("body"))
+    return bool(request.get("body")) and method_allows_request_body(request_method(request))
 
 
 def is_empty_body_post(request):
-    return request.get("method") == "POST" and not request_has_body(request)
+    return request_method(request) == "POST" and not request_has_body(request)
+
+
+def request_fetch_mode(request):
+    mode = header_value(request, "Sec-Fetch-Mode").lower()
+    if mode in SCRIPT_FRIENDLY_FETCH_MODES:
+        return mode
+    return ""
 
 
 def can_replay_urlencoded_as_form(request):
     if not is_form_urlencoded_post(request):
         return False
-    body_text = decode_body_text(request.get("body") or b"")
+    body_text = decode_body_text(request.get("body") or b"", request_content_type(request))
     if not body_text:
         return True
     for segment in body_text.split("&"):
@@ -562,7 +843,7 @@ def submit_form_post_request(tab, request):
     current_tab = resolve_live_tab(tab)
     if current_tab is None:
         raise RuntimeError("browser tab is unavailable")
-    body_text = decode_body_text(request["body"])
+    body_text = decode_body_text(request["body"], request_content_type(request))
     form_pairs = parse_qsl(body_text, keep_blank_values=True)
     if not form_pairs and body_text:
         raise RuntimeError("cannot parse x-www-form-urlencoded post body")
@@ -619,7 +900,45 @@ def multipart_boundary(content_type):
     return match.group(1).strip()
 
 
-def parse_multipart_form_fields(request):
+def content_disposition_param(disposition, key):
+    simple_match = re.search(r'(?:^|;)\s*' + re.escape(key) + r'="([^"]*)"', disposition, re.IGNORECASE)
+    if simple_match:
+        return simple_match.group(1)
+    bare_match = re.search(r'(?:^|;)\s*' + re.escape(key) + r'=([^";\s]+)', disposition, re.IGNORECASE)
+    if bare_match:
+        return bare_match.group(1)
+    return ""
+
+
+def decode_rfc5987_value(value):
+    if not value:
+        return ""
+    if "'" not in value:
+        return unquote(value)
+    charset, _, encoded = value.split("'", 2)
+    try:
+        raw = unquote(encoded, encoding="latin-1", errors="strict").encode("latin-1", errors="replace")
+        return raw.decode(charset or "utf-8", errors="replace")
+    except Exception:
+        return unquote(encoded)
+
+
+def decode_multipart_part_bytes(value_bytes, transfer_encoding):
+    encoding = (transfer_encoding or "").strip().lower()
+    if encoding == "base64":
+        try:
+            return base64.b64decode(value_bytes, validate=False)
+        except Exception:
+            return value_bytes
+    if encoding in ("quoted-printable", "quotedprintable"):
+        try:
+            return quopri.decodestring(value_bytes)
+        except Exception:
+            return value_bytes
+    return value_bytes
+
+
+def parse_multipart_form_parts(request):
     boundary = multipart_boundary(request_content_type(request))
     if not boundary:
         return None
@@ -658,15 +977,24 @@ def parse_multipart_form_fields(request):
             headers[name.strip().lower()] = value.strip()
 
         disposition = headers.get("content-disposition", "")
-        name_match = re.search(r'name="([^"]+)"', disposition, re.IGNORECASE)
-        filename_match = re.search(r'filename="([^"]*)"', disposition, re.IGNORECASE)
-        if not name_match:
+        field_name = content_disposition_param(disposition, "name")
+        file_name = content_disposition_param(disposition, "filename")
+        file_name_star = content_disposition_param(disposition, "filename*")
+        if file_name_star:
+            file_name = decode_rfc5987_value(file_name_star)
+        if not field_name:
             continue
-        if filename_match and filename_match.group(1):
-            return None
+        content_type = headers.get("content-type", "")
+        transfer_encoding = headers.get("content-transfer-encoding", "")
+        decoded_bytes = decode_multipart_part_bytes(value_bytes, transfer_encoding)
+        is_file = bool(file_name)
         parts.append({
-            "name": name_match.group(1),
-            "value": decode_body_text(value_bytes),
+            "name": field_name,
+            "filename": file_name,
+            "content_type": content_type,
+            "is_file": is_file,
+            "value": decode_body_text(decoded_bytes, content_type),
+            "value_base64": base64.b64encode(decoded_bytes).decode("ascii"),
         })
     return parts
 
@@ -677,7 +1005,7 @@ def can_submit_as_navigation_post(request):
     if is_form_urlencoded_post(request):
         return can_replay_urlencoded_as_form(request)
     if is_multipart_form_post(request):
-        return parse_multipart_form_fields(request) is not None
+        return parse_multipart_form_parts(request) is not None
     return False
 
 
@@ -688,7 +1016,7 @@ def can_auto_submit_intermediate(request):
 
 
 def can_auto_submit_challenge_intermediate(request):
-    return request.get("method") == "POST" and is_navigation_post(request)
+    return request_method(request) == "POST" and is_navigation_post(request)
 
 
 def is_navigation_non_form_post(request):
@@ -699,24 +1027,48 @@ def submit_multipart_post_request(tab, request):
     current_tab = resolve_live_tab(tab)
     if current_tab is None:
         raise RuntimeError("browser tab is unavailable")
-    form_parts = parse_multipart_form_fields(request)
-    if form_parts is None:
+    form_parts = parse_multipart_form_parts(request)
+    if not form_parts:
         raise RuntimeError("cannot parse multipart form-data post body")
 
     script = """
 (() => {
     const targetUrl = __URL__;
     const parts = __PARTS__;
+    const decodeBase64 = (value) => {
+        if (!value) {
+            return new Uint8Array(0);
+        }
+        const binary = atob(value);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+    };
     const form = document.createElement('form');
     form.method = 'POST';
     form.action = targetUrl;
     form.enctype = 'multipart/form-data';
     form.style.display = 'none';
     for (const part of parts) {
+        if (part.is_file) {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.name = part.name;
+            const file = new File([decodeBase64(part.value_base64)], part.filename || 'upload.bin', {
+                type: part.content_type || 'application/octet-stream',
+            });
+            const transfer = new DataTransfer();
+            transfer.items.add(file);
+            input.files = transfer.files;
+            form.appendChild(input);
+            continue;
+        }
         const input = document.createElement('input');
         input.type = 'hidden';
         input.name = part.name;
-        input.value = part.value;
+        input.value = part.value || '';
         form.appendChild(input);
     }
     document.body.appendChild(form);
@@ -739,6 +1091,8 @@ def allowed_script_headers(request):
         "origin",
         "referer",
         "accept-encoding",
+        "accept-language",
+        "user-agent",
         "upgrade-insecure-requests",
     }
     for name, value in parse_headers(request["headers"]):
@@ -766,6 +1120,221 @@ def response_headers(response):
     except Exception:
         pass
     return {}
+
+
+def response_header_value_from_lines(header_lines, name):
+    expected = (name or "").lower()
+    for line in header_lines or ():
+        header_name, _, header_value_text = (line or "").partition(":")
+        if header_name.strip().lower() == expected:
+            return header_value_text.strip()
+    return ""
+
+
+def packet_header_value(headers, name):
+    expected = (name or "").lower()
+    if hasattr(headers, "items"):
+        for header_name, header_value_text in headers.items():
+            if str(header_name).strip().lower() == expected:
+                return str(header_value_text).strip()
+    return ""
+
+
+def sanitize_metadata_value(value, limit=768):
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def result_header_lines(result):
+    headers = result.get("headers") or []
+    if isinstance(headers, dict):
+        return [f"{key}: {value}" for key, value in headers.items()]
+    return list(headers)
+
+
+def append_result_header_lines(result, extra_lines):
+    combined = result_header_lines(result)
+    seen = {(line.split(":", 1)[0].strip().lower(), line.split(":", 1)[1].strip())
+            for line in combined if ":" in line}
+    for line in extra_lines or ():
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        key = (name.strip().lower(), value.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(f"{name.strip()}: {value.strip()}")
+    result["headers"] = combined
+    content_type = response_header_value_from_lines(combined, "Content-Type")
+    if content_type:
+        result["content_type"] = content_type
+    return result
+
+
+def collect_resource_timing(tab, result, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return {}
+    script = """
+return JSON.stringify((() => {
+    const finalUrl = __FINAL_URL__;
+    const fallbackUrl = __REQUEST_URL__;
+    const entries = performance.getEntriesByType('resource') || [];
+    const matched = [];
+    for (const entry of entries) {
+        if (!entry || !entry.name) {
+            continue;
+        }
+        if (entry.name === finalUrl || entry.name === fallbackUrl) {
+            matched.push(entry);
+        }
+    }
+    const entry = matched.length ? matched[matched.length - 1] : null;
+    if (!entry) {
+        return {};
+    }
+    return {
+        name: entry.name || '',
+        initiator_type: entry.initiatorType || '',
+        next_hop_protocol: entry.nextHopProtocol || '',
+        transfer_size: Number(entry.transferSize || 0),
+        encoded_body_size: Number(entry.encodedBodySize || 0),
+        decoded_body_size: Number(entry.decodedBodySize || 0),
+        redirect_start: Number(entry.redirectStart || 0),
+        redirect_end: Number(entry.redirectEnd || 0),
+    };
+})());
+"""
+    script = script.replace("__FINAL_URL__", json.dumps(result.get("final_url") or request["url"]))
+    script = script.replace("__REQUEST_URL__", json.dumps(request["url"]))
+    try:
+        raw = current_tab.run_js(script)
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def start_observed_request_capture(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return False
+    try:
+        current_tab.listen.start(request["url"], method=True, res_type=True)
+        return True
+    except Exception:
+        return False
+
+
+def wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=False):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return None
+    deadline = time.time() + max(0.6, min(timeout_seconds, 2.4))
+    best_packet = None
+    while time.time() < deadline:
+        try:
+            packet = current_tab.listen.wait(timeout=min(0.6, max(0.1, deadline - time.time())))
+        except Exception:
+            return best_packet
+        if not packet or not packet_matches_request(packet, request):
+            continue
+        best_packet = packet
+        if not require_response or packet_has_response(packet):
+            return packet
+    return best_packet
+
+
+def build_redirect_chain(request, result, observed_packet):
+    chain = [request["url"]]
+    try:
+        location = packet_header_value(getattr(getattr(observed_packet, "response", None), "headers", None), "Location")
+        if location:
+            resolved = urljoin(request["url"], location)
+            if resolved not in chain:
+                chain.append(resolved)
+    except Exception:
+        pass
+    final_url = result.get("final_url") or ""
+    if final_url and final_url not in chain:
+        chain.append(final_url)
+    return chain
+
+
+def build_result_metadata_headers(tab, request, result, observed_packet=None):
+    header_lines = []
+    original_header_lines = result_header_lines(result)
+    redirect_chain = build_redirect_chain(request, result, observed_packet)
+    if len(redirect_chain) > 1:
+        header_lines.append("X-PassRS-Redirect-Chain: " + sanitize_metadata_value(" -> ".join(redirect_chain)))
+    requested_accept_encoding = header_value(request, "Accept-Encoding")
+    if requested_accept_encoding:
+        header_lines.append("X-PassRS-Requested-Accept-Encoding: " + sanitize_metadata_value(requested_accept_encoding))
+    for original_name, passrs_name in (
+        ("Origin", "X-PassRS-Requested-Origin"),
+        ("Referer", "X-PassRS-Requested-Referer"),
+        ("Sec-Fetch-Site", "X-PassRS-Requested-Sec-Fetch-Site"),
+        ("Sec-Fetch-Mode", "X-PassRS-Requested-Sec-Fetch-Mode"),
+        ("Sec-Fetch-Dest", "X-PassRS-Requested-Sec-Fetch-Dest"),
+    ):
+        value = header_value(request, original_name)
+        if value:
+            header_lines.append(f"{passrs_name}: {sanitize_metadata_value(value)}")
+
+    observed_pairs = [
+        ("Origin", "X-PassRS-Observed-Request-Origin"),
+        ("Referer", "X-PassRS-Observed-Request-Referer"),
+        ("Sec-Fetch-Site", "X-PassRS-Observed-Request-Sec-Fetch-Site"),
+        ("Sec-Fetch-Mode", "X-PassRS-Observed-Request-Sec-Fetch-Mode"),
+        ("Sec-Fetch-Dest", "X-PassRS-Observed-Request-Sec-Fetch-Dest"),
+        ("Accept-Encoding", "X-PassRS-Observed-Request-Accept-Encoding"),
+    ]
+    if observed_packet is not None:
+        request_headers = getattr(getattr(observed_packet, "request", None), "headers", None)
+        response_obj = getattr(observed_packet, "response", None)
+        response_headers = getattr(response_obj, "headers", None)
+        for original_name, passrs_name in observed_pairs:
+            value = packet_header_value(request_headers, original_name)
+            if value:
+                header_lines.append(f"{passrs_name}: {sanitize_metadata_value(value)}")
+        for original_name, passrs_name in (
+            ("Content-Encoding", "X-PassRS-Observed-Response-Content-Encoding"),
+            ("Transfer-Encoding", "X-PassRS-Observed-Response-Transfer-Encoding"),
+            ("Content-Length", "X-PassRS-Observed-Response-Content-Length"),
+        ):
+            value = packet_header_value(response_headers, original_name)
+            if value:
+                header_lines.append(f"{passrs_name}: {sanitize_metadata_value(value)}")
+        protocol = getattr(response_obj, "protocol", "") or ""
+        if protocol:
+            header_lines.append("X-PassRS-Observed-Response-Protocol: " + sanitize_metadata_value(protocol))
+        encoded_length = getattr(response_obj, "encodedDataLength", None)
+        if encoded_length not in (None, ""):
+            header_lines.append("X-PassRS-Observed-Encoded-Data-Length: " + sanitize_metadata_value(encoded_length))
+
+    content_encoding = response_header_value_from_lines(original_header_lines, "Content-Encoding")
+    if content_encoding:
+        header_lines.append("X-PassRS-Original-Content-Encoding: " + sanitize_metadata_value(content_encoding))
+    transfer_encoding = response_header_value_from_lines(original_header_lines, "Transfer-Encoding")
+    if transfer_encoding:
+        header_lines.append("X-PassRS-Original-Transfer-Encoding: " + sanitize_metadata_value(transfer_encoding))
+
+    timing = collect_resource_timing(tab, result, request)
+    for timing_key, header_name in (
+        ("initiator_type", "X-PassRS-Timing-Initiator-Type"),
+        ("next_hop_protocol", "X-PassRS-Timing-Next-Hop-Protocol"),
+        ("transfer_size", "X-PassRS-Timing-Transfer-Size"),
+        ("encoded_body_size", "X-PassRS-Timing-Encoded-Body-Size"),
+        ("decoded_body_size", "X-PassRS-Timing-Decoded-Body-Size"),
+    ):
+        value = timing.get(timing_key)
+        if value not in (None, "", 0):
+            header_lines.append(f"{header_name}: {sanitize_metadata_value(value)}")
+    if timing.get("redirect_end", 0) > timing.get("redirect_start", 0):
+        header_lines.append("X-PassRS-Timing-Redirected: true")
+    return header_lines
 
 
 def origin_url(url):
@@ -1073,6 +1642,7 @@ def parse_script_response(tab, result_text, request):
         "navigation_pending": bool(result.get("navigation_pending")),
         "navigation_kind": result.get("navigation_kind", ""),
         "challenge_like": bool(result.get("challenge_like")),
+        "redirected": bool(result.get("redirected")),
     }
 
 
@@ -1166,6 +1736,7 @@ def execute_fetch_request(tab, request):
     const headers = __HEADERS__;
     const bodyBase64 = __BODY__;
     const referrer = __REFERRER__;
+    const fetchMode = __FETCH_MODE__;
     const decode = (value) => {
         if (!value) {
             return new Uint8Array(0);
@@ -1195,6 +1766,9 @@ def execute_fetch_request(tab, request):
             cache: "no-store",
             referrer: referrer || undefined,
         };
+        if (fetchMode) {
+            options.mode = fetchMode;
+        }
         if (method !== "GET" && method !== "HEAD" && body.length) {
             options.body = body;
         }
@@ -1209,7 +1783,8 @@ def execute_fetch_request(tab, request):
             reason: response.statusText || "",
             headers: responseHeaders.join("\\n"),
             body_base64: encode(responseBytes),
-            final_url: response.url || url
+            final_url: response.url || url,
+            redirected: !!response.redirected
         });
     } catch (e) {
         return JSON.stringify({error: String(e)});
@@ -1221,26 +1796,43 @@ def execute_fetch_request(tab, request):
     script = script.replace("__HEADERS__", json.dumps(headers, ensure_ascii=False))
     script = script.replace("__BODY__", json.dumps(base64.b64encode(request["body"]).decode("ascii")))
     script = script.replace("__REFERRER__", json.dumps(header_value(request, "Referer")))
+    script = script.replace("__FETCH_MODE__", json.dumps(request_fetch_mode(request)))
     return parse_script_response(tab, evaluate_async_json(tab, script), request)
 
 
-def execute_fetch_post_request(tab, request):
+def execute_script_request(tab, request):
     try:
         return execute_fetch_request(tab, request)
     except Exception:
         return execute_xhr_request(tab, request)
 
 
-def execute_fetch_get_request(tab, request):
+def execute_get_like_request(tab, request):
     if request_has_body(request):
         return execute_xhr_request(tab, request)
     return execute_fetch_request(tab, request)
 
 
-def decode_body_text(body_bytes):
+def content_type_charset(content_type):
+    match = re.search(r"charset\s*=\s*['\"]?([^;'\"]+)", content_type or "", re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).strip().strip('"').strip("'")
+
+
+def decode_body_text(body_bytes, content_type=""):
     if not body_bytes:
         return ""
-    for encoding in ("utf-8", "gbk", "gb18030", "latin-1"):
+    encodings = []
+    charset = content_type_charset(content_type)
+    if charset:
+        encodings.append(charset)
+    encodings.extend(("utf-8", "gbk", "gb18030", "latin-1"))
+    seen = set()
+    for encoding in encodings:
+        if not encoding or encoding.lower() in seen:
+            continue
+        seen.add(encoding.lower())
         try:
             return body_bytes.decode(encoding)
         except Exception:
@@ -1587,7 +2179,7 @@ def is_post_challenge_result(result):
     content_type = (result.get("content_type", "") or "").lower()
     if "text/html" not in content_type:
         return False
-    body_text = decode_body_text(result.get("body", b"")).lower()
+    body_text = decode_body_text(result.get("body", b""), result.get("content_type", "")).lower()
     if not body_text:
         return False
     if len(body_text) > POST_CHALLENGE_BODY_LIMIT:
@@ -1699,7 +2291,7 @@ def load_challenge_page(tab, request, result, timeout_seconds):
     current_tab = resolve_live_tab(tab)
     if current_tab is None:
         raise RuntimeError("browser tab is unavailable")
-    html = decode_body_text(result.get("body", b""))
+    html = decode_body_text(result.get("body", b""), result.get("content_type", ""))
     if not html:
         return
     restore_page_hooks(current_tab)
@@ -2541,12 +3133,18 @@ def complete_navigation_post_challenge(tab, request, timeout_seconds):
     return None
 
 
+def finalize_result_with_metadata(tab, request, result, observed_packet=None):
+    if result is None:
+        return None
+    return append_result_header_lines(result, build_result_metadata_headers(tab, request, result, observed_packet))
+
+
 def execute_navigation_non_form_post_request(tab, request, timeout_seconds, allow_static_resources):
     configure_tab_network(tab, allow_static_resources)
     ensure_post_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
 
-    initial_result = execute_fetch_post_request(tab, request)
+    initial_result = execute_script_request(tab, request)
     if not is_post_challenge_result(initial_result):
         return initial_result
 
@@ -2612,7 +3210,7 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
     configure_tab_network(tab, allow_static_resources)
     ensure_post_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
-    result = execute_fetch_post_request(tab, request)
+    result = execute_script_request(tab, request)
     if not is_post_challenge_result(result):
         return result
 
@@ -2632,11 +3230,51 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
         if page_result is not None:
             return page_result
         ensure_post_context(tab, request, timeout_seconds)
-        retry_result = execute_fetch_post_request(tab, request)
+        retry_result = execute_script_request(tab, request)
         if not is_post_challenge_result(retry_result):
             return retry_result
         last_result = retry_result
     return last_result
+
+
+def execute_generic_script_method_request(tab, request, timeout_seconds, allow_static_resources):
+    configure_tab_network(tab, allow_static_resources)
+    ensure_fetch_context(tab, request, timeout_seconds)
+    set_request_cookies(tab, request)
+    method = request_method(request)
+    try:
+        result = execute_script_request(tab, request)
+    except Exception:
+        packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=True)
+        packet_result = observed_result_from_packet(packet, request)
+        if packet_result is not None:
+            return packet_result
+        if method == "HEAD":
+            return execute_python_head_request(request, timeout_seconds)
+        raise
+    if method == "HEAD" and int(result.get("status", 0) or 0) <= 0:
+        packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=True)
+        packet_result = head_result_from_observed_packet(packet, request)
+        if packet_result is not None:
+            return packet_result
+        return execute_python_head_request(request, timeout_seconds)
+    if not is_post_challenge_result(result):
+        return result
+
+    load_challenge_page(tab, request, result, timeout_seconds)
+    wait_for_post_challenge(tab, timeout_seconds)
+
+    captured_result = wait_for_captured_browser_result(tab, request, timeout_seconds)
+    if captured_result is not None and not is_post_challenge_result(captured_result):
+        return captured_result
+
+    page_result = current_page_result(tab, request)
+    if page_result is not None:
+        return page_result
+    final_result = final_stable_page_result(tab, request, timeout_seconds)
+    if final_result is not None:
+        return final_result
+    return result
 
 
 def execute_get_request(tab, request, timeout_seconds, allow_static_resources):
@@ -2644,7 +3282,7 @@ def execute_get_request(tab, request, timeout_seconds, allow_static_resources):
     set_request_cookies(tab, request)
     if not is_navigation_get(request):
         ensure_fetch_context(tab, request, timeout_seconds)
-        return execute_fetch_get_request(tab, request)
+        return execute_get_like_request(tab, request)
     current_tab = resolve_live_tab(tab)
     current_tab.get(request["url"], retry=0, interval=0, timeout=timeout_seconds)
     wait_for_initial_load(current_tab, timeout_seconds)
@@ -2665,6 +3303,19 @@ def execute_get_request(tab, request, timeout_seconds, allow_static_resources):
         "final_url": safe_tab_url(current_tab) or request["url"],
         "title": getattr(current_tab, "title", ""),
     }
+
+
+def execute_request(tab, request, timeout_seconds, allow_static_resources):
+    method = request_method(request)
+    if method == "HEAD":
+        return execute_head_request(tab, request, timeout_seconds, allow_static_resources)
+    if method == "POST":
+        return execute_post_request(tab, request, timeout_seconds, allow_static_resources)
+    if method == "GET":
+        return execute_get_request(tab, request, timeout_seconds, allow_static_resources)
+    if method in ("PUT", "PATCH", "DELETE", "OPTIONS"):
+        return execute_generic_script_method_request(tab, request, timeout_seconds, allow_static_resources)
+    raise RuntimeError(f"unsupported request method: {method or 'UNKNOWN'}")
 
 
 def close_browser(args):
@@ -2716,15 +3367,16 @@ def navigate(args):
             browser = Chromium(build_options(args, port, existing_only=True))
             save_state(args.state_file, port)
             tab = resolve_request_tab(browser, request)
+            start_observed_request_capture(tab, request)
+            apply_managed_request_headers(tab, request)
         except Exception as exc:
             last_error = exc
             clear_state(args.state_file)
             continue
         try:
-            if request["method"] == "POST":
-                result = execute_post_request(tab, request, timeout_seconds, args.load_static_resources)
-            else:
-                result = execute_get_request(tab, request, timeout_seconds, args.load_static_resources)
+            result = execute_request(tab, request, timeout_seconds, args.load_static_resources)
+            observed_packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=False)
+            result = finalize_result_with_metadata(tab, request, result, observed_packet)
             print_response(result)
             return
         except Exception as exc:
@@ -2734,7 +3386,16 @@ def navigate(args):
                     tab.listen.stop()
             except Exception:
                 pass
+            try:
+                clear_managed_request_headers(tab)
+            except Exception:
+                pass
             raise last_error
+        finally:
+            try:
+                clear_managed_request_headers(tab)
+            except Exception:
+                pass
 
     launch_port = next_launch_port(args)
     tab = None
@@ -2742,10 +3403,11 @@ def navigate(args):
         browser = Chromium(build_options(args, launch_port))
         save_state(args.state_file, launch_port)
         tab = resolve_request_tab(browser, request)
-        if request["method"] == "POST":
-            result = execute_post_request(tab, request, timeout_seconds, args.load_static_resources)
-        else:
-            result = execute_get_request(tab, request, timeout_seconds, args.load_static_resources)
+        start_observed_request_capture(tab, request)
+        apply_managed_request_headers(tab, request)
+        result = execute_request(tab, request, timeout_seconds, args.load_static_resources)
+        observed_packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=False)
+        result = finalize_result_with_metadata(tab, request, result, observed_packet)
         print_response(result)
         return
     except Exception as exc:
@@ -2753,6 +3415,15 @@ def navigate(args):
         try:
             if tab is not None:
                 tab.listen.stop()
+        except Exception:
+            pass
+        try:
+            clear_managed_request_headers(tab)
+        except Exception:
+            pass
+    finally:
+        try:
+            clear_managed_request_headers(tab)
         except Exception:
             pass
 

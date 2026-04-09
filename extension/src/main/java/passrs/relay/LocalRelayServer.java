@@ -306,8 +306,12 @@ public final class LocalRelayServer {
         byte[] body = browserResponse.body();
         exchange.setStatusCode(browserResponse.status() < 100 ? 500 : browserResponse.status());
         AtomicBoolean hasContentLength = new AtomicBoolean(false);
-        for (Map.Entry<String, String> entry : browserResponse.headers().entrySet()) {
-            String name = sanitizeHeaderName(entry.getKey());
+        for (String headerLine : browserResponse.headers()) {
+            int index = headerLine == null ? -1 : headerLine.indexOf(':');
+            if (index <= 0) {
+                continue;
+            }
+            String name = sanitizeHeaderName(headerLine.substring(0, index));
             if (name.isBlank()
                     || name.equalsIgnoreCase("transfer-encoding")
                     || name.equalsIgnoreCase("content-encoding")
@@ -317,7 +321,8 @@ public final class LocalRelayServer {
             if (name.equalsIgnoreCase("content-length")) {
                 hasContentLength.set(true);
             }
-            exchange.getResponseHeaders().add(new HttpString(name), sanitizeHeaderValue(entry.getValue()));
+            exchange.getResponseHeaders().add(new HttpString(name),
+                    sanitizeHeaderValue(headerLine.substring(index + 1).trim()));
         }
         exchange.getResponseHeaders().put(new HttpString(HEADER_FINAL_URL), sanitizeHeaderValue(browserResponse.finalUrl()));
         exchange.getResponseHeaders().put(new HttpString(HEADER_PAGE_TITLE), sanitizeHeaderValue(browserResponse.title()));

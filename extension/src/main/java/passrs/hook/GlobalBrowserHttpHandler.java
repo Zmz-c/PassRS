@@ -19,6 +19,9 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 public final class GlobalBrowserHttpHandler implements HttpHandler {
+    private static final Set<String> SUPPORTED_METHODS = Set.of(
+            "GET", "POST"
+    );
     private static final Set<String> STATIC_RESOURCE_EXTENSIONS = Set.of(
             "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "css", "js", "mjs", "map",
             "woff", "woff2", "ttf", "otf", "eot", "mp3", "wav", "flac", "ogg", "mp4", "avi",
@@ -83,8 +86,7 @@ public final class GlobalBrowserHttpHandler implements HttpHandler {
     }
 
     private boolean supports(HttpRequest request) {
-        String method = safeMethod(request);
-        return "GET".equalsIgnoreCase(method) || "POST".equalsIgnoreCase(method);
+        return SUPPORTED_METHODS.contains(safeMethod(request).toUpperCase(Locale.ROOT));
     }
 
     private boolean looksLikeStandaloneStaticResource(HttpRequest request) {

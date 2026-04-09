@@ -4,7 +4,6 @@ import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.http.message.responses.HttpResponse;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
 
 public final class BrowserResponseMapper {
 
@@ -22,15 +21,19 @@ public final class BrowserResponseMapper {
                 .append("\r\n");
 
         boolean hasContentLength = false;
-        for (Map.Entry<String, String> entry : browserResponse.headers().entrySet()) {
-            String name = entry.getKey();
+        for (String headerLine : browserResponse.headers()) {
+            int index = headerLine == null ? -1 : headerLine.indexOf(':');
+            if (index <= 0) {
+                continue;
+            }
+            String name = headerLine.substring(0, index).trim();
             if ("transfer-encoding".equalsIgnoreCase(name) || "content-encoding".equalsIgnoreCase(name)) {
                 continue;
             }
             if ("content-length".equalsIgnoreCase(name)) {
                 hasContentLength = true;
             }
-            headers.append(name).append(": ").append(entry.getValue()).append("\r\n");
+            headers.append(name).append(": ").append(headerLine.substring(index + 1).trim()).append("\r\n");
         }
         if (!hasContentLength) {
             headers.append("Content-Length: ").append(bodyBytes.length).append("\r\n");

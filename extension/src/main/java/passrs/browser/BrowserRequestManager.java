@@ -420,14 +420,12 @@ public final class BrowserRequestManager {
         }
         Map<String, String> lines = parseKeyValueLines(output);
         int headerCount = parseInt(lines.get("HEADER_COUNT"), 0);
-        Map<String, String> headers = new LinkedHashMap<>();
+        List<String> headers = new ArrayList<>();
         for (int i = 0; i < headerCount; i++) {
             String headerLine = decodeString(lines.get("HEADER_" + i));
-            int index = headerLine.indexOf(':');
-            if (index <= 0) {
-                continue;
+            if (!isEmpty(headerLine)) {
+                headers.add(headerLine);
             }
-            headers.put(headerLine.substring(0, index).trim(), headerLine.substring(index + 1).trim());
         }
         return new BrowserResponse(
                 parseInt(lines.get("STATUS"), -1),
