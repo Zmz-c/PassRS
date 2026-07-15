@@ -4,6 +4,7 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ToolType;
 import passrs.browser.BrowserRequestManager;
 import passrs.config.ExtensionConfig;
+import passrs.mcp.LocalMcpServer;
 import passrs.relay.LocalRelayServer;
 
 import javax.swing.BorderFactory;
@@ -50,6 +51,7 @@ public final class PassRsPanel {
     private final ExtensionConfig config;
     private final BrowserRequestManager browserRequestManager;
     private final LocalRelayServer relayServer;
+    private final LocalMcpServer mcpServer;
 
     private final JPanel root;
     private final JCheckBox enabledCheckBox;
@@ -61,6 +63,7 @@ public final class PassRsPanel {
     private final JTextField targetHostRegexField;
     private final JCheckBox loadStaticResourcesCheckBox;
     private final JLabel relayAddressValue;
+    private final JLabel mcpAddressValue;
     private final JLabel modeValue;
     private final JLabel statusLabel;
     private final Map<ToolType, JCheckBox> toolCheckBoxes;
@@ -68,11 +71,12 @@ public final class PassRsPanel {
     private volatile boolean loadingConfig;
 
     public PassRsPanel(MontoyaApi api, ExtensionConfig config, BrowserRequestManager browserRequestManager,
-                       LocalRelayServer relayServer) {
+                       LocalRelayServer relayServer, LocalMcpServer mcpServer) {
         this.api = api;
         this.config = config;
         this.browserRequestManager = browserRequestManager;
         this.relayServer = relayServer;
+        this.mcpServer = mcpServer;
 
         root = new JPanel(new BorderLayout(16, 16));
         enabledCheckBox = new JCheckBox("Enable relay hook");
@@ -84,6 +88,7 @@ public final class PassRsPanel {
         targetHostRegexField = new JTextField(34);
         loadStaticResourcesCheckBox = new JCheckBox("Allow images/media/font resources during browser rendering");
         relayAddressValue = new JLabel();
+        mcpAddressValue = new JLabel();
         modeValue = new JLabel();
         statusLabel = new JLabel("Idle");
         toolCheckBoxes = createToolCheckBoxes();
@@ -232,6 +237,8 @@ public final class PassRsPanel {
         content.add(Box.createVerticalStrut(10));
         content.add(buildMetric("Relay Address", relayAddressValue));
         content.add(Box.createVerticalStrut(10));
+        content.add(buildMetric("MCP Address", mcpAddressValue));
+        content.add(Box.createVerticalStrut(10));
         content.add(buildMetric("Browser Bridge", new JLabel("Python + DrissionPage")));
         content.add(Box.createVerticalGlue());
         panel.add(content, BorderLayout.CENTER);
@@ -358,6 +365,7 @@ public final class PassRsPanel {
 
     private void refreshRuntime(ExtensionConfig.Snapshot snapshot) {
         relayAddressValue.setText(relayServer.relayBaseUrl());
+        mcpAddressValue.setText(mcpServer.mcpEndpointUrl());
         modeValue.setText(snapshot.enabled()
                 ? "Enabled | " + scopeModeLabel(snapshot.scopeMode()) + " | " + selectedToolSummary(snapshot.toolTypes())
                 + regexSummary(snapshot.targetHostRegex())

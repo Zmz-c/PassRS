@@ -7,6 +7,7 @@ import burp.api.montoya.extension.ExtensionUnloadingHandler;
 import passrs.browser.BrowserRequestManager;
 import passrs.config.ExtensionConfig;
 import passrs.hook.GlobalBrowserHttpHandler;
+import passrs.mcp.LocalMcpServer;
 import passrs.relay.LocalRelayServer;
 import passrs.ui.PassRsPanel;
 
@@ -18,6 +19,7 @@ public final class PassRsExtension implements BurpExtension, ExtensionUnloadingH
     private GlobalBrowserHttpHandler httpHandler;
     private Registration httpHandlerRegistration;
     private LocalRelayServer relayServer;
+    private LocalMcpServer mcpServer;
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -30,7 +32,12 @@ public final class PassRsExtension implements BurpExtension, ExtensionUnloadingH
                 panel.setStatus(message);
             }
         });
-        panel = new PassRsPanel(api, config, browserRequestManager, relayServer);
+        mcpServer = new LocalMcpServer(config, browserRequestManager, api.logging(), message -> {
+            if (panel != null) {
+                panel.setStatus(message);
+            }
+        });
+        panel = new PassRsPanel(api, config, browserRequestManager, relayServer, mcpServer);
         httpHandler = new GlobalBrowserHttpHandler(
                 config,
                 relayServer,
@@ -51,6 +58,9 @@ public final class PassRsExtension implements BurpExtension, ExtensionUnloadingH
         }
         if (httpHandler != null) {
             httpHandler.shutdown();
+        }
+        if (mcpServer != null) {
+            mcpServer.shutdown();
         }
         if (panel != null) {
             panel.shutdown();

@@ -27,8 +27,9 @@ final class ProcessExecutor {
             builder.directory(workingDirectory.toFile());
         }
         Process process = builder.start();
+        InputStream processOutput = process.getInputStream();
         StringBuilder output = new StringBuilder();
-        Thread readerThread = startOutputReader(process.getInputStream(), output);
+        Thread readerThread = startOutputReader(processOutput, output);
         activeProcesses.add(process);
         try {
             boolean completed;
@@ -41,16 +42,16 @@ final class ProcessExecutor {
             }
             if (!completed) {
                 process.destroyForcibly();
-                joinReader(readerThread);
+                joinReader(readerThread, processOutput);
                 throw new IllegalStateException("python browser bridge timeout");
             }
-            joinReader(readerThread);
+            joinReader(readerThread, processOutput);
             int exitCode = process.exitValue();
-            return new ProcessResult(exitCode, output.toString());
+            return new ProcessResult(exitCode, outputSnapshot(output));
         } finally {
             activeProcesses.remove(process);
             try {
-                process.getInputStream().close();
+                processOutput.close();
             } catch (IOException ignored) {
             }
         }
@@ -123,14 +124,25 @@ final class ProcessExecutor {
         return thread;
     }
 
-    private void joinReader(Thread thread) {
+    private void joinReader(Thread thread, InputStream inputStream) {
         if (thread == null) {
             return;
         }
         try {
-            thread.join(1000L);
+            thread.join(5000L);
+            if (thread.isAlive()) {
+                inputStream.close();
+                thread.join(1000L);
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } catch (IOException ignored) {
+        }
+    }
+
+    private String outputSnapshot(StringBuilder output) {
+        synchronized (output) {
+            return output.toString();
         }
     }
 

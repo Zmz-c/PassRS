@@ -30,7 +30,6 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 public final class LocalRelayServer {
@@ -305,7 +304,6 @@ public final class LocalRelayServer {
     private void writeBrowserResponse(HttpServerExchange exchange, BrowserResponse browserResponse) throws IOException {
         byte[] body = browserResponse.body();
         exchange.setStatusCode(browserResponse.status() < 100 ? 500 : browserResponse.status());
-        AtomicBoolean hasContentLength = new AtomicBoolean(false);
         for (String headerLine : browserResponse.headers()) {
             int index = headerLine == null ? -1 : headerLine.indexOf(':');
             if (index <= 0) {
@@ -315,20 +313,16 @@ public final class LocalRelayServer {
             if (name.isBlank()
                     || name.equalsIgnoreCase("transfer-encoding")
                     || name.equalsIgnoreCase("content-encoding")
+                    || name.equalsIgnoreCase("content-length")
                     || name.equalsIgnoreCase("connection")) {
                 continue;
-            }
-            if (name.equalsIgnoreCase("content-length")) {
-                hasContentLength.set(true);
             }
             exchange.getResponseHeaders().add(new HttpString(name),
                     sanitizeHeaderValue(headerLine.substring(index + 1).trim()));
         }
         exchange.getResponseHeaders().put(new HttpString(HEADER_FINAL_URL), sanitizeHeaderValue(browserResponse.finalUrl()));
         exchange.getResponseHeaders().put(new HttpString(HEADER_PAGE_TITLE), sanitizeHeaderValue(browserResponse.title()));
-        if (!hasContentLength.get()) {
-            exchange.setResponseContentLength(body.length);
-        }
+        exchange.setResponseContentLength(body.length);
         try (OutputStream outputStream = exchange.getOutputStream()) {
             outputStream.write(body);
         }

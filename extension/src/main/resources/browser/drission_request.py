@@ -266,6 +266,11 @@ def build_options(args, port, existing_only=False):
     options.set_load_mode("eager")
     options.ignore_certificate_errors()
     options.set_argument("--allow-insecure-localhost")
+    # BrowserRequestManager supplies an isolated per-session profile. The relay
+    # must be able to read responses even when the replayed page lacks CORS
+    # headers; otherwise Chromium reports a generic TypeError after sending it.
+    options.set_argument("--disable-web-security")
+    options.set_argument("--allow-running-insecure-content")
     options.set_argument("--disable-background-networking")
     options.set_argument("--disable-component-update")
     options.set_argument("--disable-domain-reliability")
@@ -337,13 +342,17 @@ def iter_browser_tabs(browser):
 
 def resolve_request_tab(browser, request):
     target_origin = origin_url(request["url"])
+    context_origin = origin_url(preferred_context_url(request))
     referer = header_value(request, "Referer")
     tabs = iter_browser_tabs(browser)
     if is_http_url(referer):
         for tab in tabs:
             tab_url = getattr(tab, "url", "") or ""
-            if tab_url == referer or tab_url.startswith(referer):
+            if same_page_url(tab_url, referer):
                 return tab
+    for tab in tabs:
+        if current_origin(tab) == context_origin:
+            return tab
     for tab in tabs:
         if current_origin(tab) == target_origin:
             return tab
@@ -442,11 +451,17 @@ def configure_tab_network(tab, allow_static_resources):
         current_tab.run_cdp("Network.enable")
     except Exception:
         pass
-    if not allow_static_resources:
-        try:
-            current_tab.run_cdp("Network.setBlockedURLs", urls=BLOCKED_RESOURCE_PATTERNS)
-        except Exception:
-            pass
+    try:
+        current_tab.run_cdp(
+            "Network.setBlockedURLs",
+            urls=[] if allow_static_resources else BLOCKED_RESOURCE_PATTERNS,
+        )
+    except Exception:
+        pass
+    try:
+        current_tab.run_cdp("Page.setBypassCSP", enabled=True)
+    except Exception:
+        pass
 
 
 def managed_request_headers(request):
@@ -498,12 +513,37 @@ def clear_managed_request_headers(tab):
 
 def packet_header_lines(packet):
     response = packet_response(packet)
-    headers = getattr(response, "headers", None)
     result = []
+    try:
+        headers = getattr(response, "headers", None)
+    except Exception:
+        headers = None
     if hasattr(headers, "items"):
         for name, value in headers.items():
             result.append(f"{str(name).strip()}: {str(value).strip()}")
+    if result:
+        return result
+    extra_headers = packet_response_extra_info(packet).get("headers")
+    if hasattr(extra_headers, "items"):
+        for name, value in extra_headers.items():
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    result.append(f"{str(name).strip()}: {str(item).strip()}")
+            else:
+                result.append(f"{str(name).strip()}: {str(value).strip()}")
     return result
+
+
+def packet_response_extra_info(packet):
+    raw_info = getattr(packet, "_responseExtraInfo", None)
+    if isinstance(raw_info, dict):
+        return raw_info
+    try:
+        extra_info = getattr(packet_response(packet), "extra_info", None)
+        all_info = getattr(extra_info, "all_info", None)
+        return all_info if isinstance(all_info, dict) else {}
+    except Exception:
+        return {}
 
 
 def packet_request_method(packet):
@@ -535,7 +575,14 @@ def packet_matches_request(packet, request):
     packet_target_url = packet_url(packet)
     if not packet_target_url:
         return True
-    return packet_target_url == request["url"] or packet_target_url.startswith(request["url"])
+    return normalized_request_url(packet_target_url) == normalized_request_url(request["url"])
+
+
+def normalized_request_url(value):
+    try:
+        return urlparse(value or "")._replace(fragment="").geturl()
+    except Exception:
+        return value or ""
 
 
 def packet_has_response(packet):
@@ -578,21 +625,78 @@ def head_result_from_observed_packet(packet, request):
     }
 
 
-def observed_result_from_packet(packet, request):
+def observed_result_from_packet(packet, request, tab=None):
     status = packet_status(packet)
     if status <= 0:
         return None
     headers = packet_header_lines(packet)
-    headers.append("X-PassRS-Observed-Body-Unavailable: true")
+    body = packet_response_body_bytes(packet, tab)
+    headers.append("X-PassRS-Fallback: browser-network-listener")
+    if body is None:
+        body = b""
+        headers.append("X-PassRS-Observed-Body-Unavailable: true")
     return {
         "status": status,
         "reason": packet_reason(packet),
         "headers": headers,
-        "body": b"",
+        "body": body,
         "final_url": packet_final_url(packet, request),
         "content_type": response_header_value_from_lines(headers, "Content-Type"),
         "title": "",
     }
+
+
+def packet_response_body_bytes(packet, tab=None):
+    response = packet_response(packet)
+    if response is None:
+        return None
+    try:
+        raw_body = getattr(response, "raw_body", None)
+        if raw_body is not None:
+            if isinstance(raw_body, bytes):
+                return raw_body
+            if getattr(response, "_is_base64_body", False):
+                return base64.b64decode(raw_body or "")
+            if isinstance(raw_body, str):
+                return raw_body.encode("utf-8", errors="replace")
+    except Exception:
+        pass
+    listener_body = listener_response_body_bytes(tab, packet)
+    if listener_body is not None:
+        return listener_body
+    try:
+        body = getattr(response, "body", None)
+        if body is None:
+            return None
+        if isinstance(body, bytes):
+            return body
+        if isinstance(body, str):
+            return body.encode("utf-8", errors="replace")
+        return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        return None
+
+
+def listener_response_body_bytes(tab, packet):
+    if tab is None or packet is None:
+        return None
+    try:
+        raw_request = getattr(packet, "_raw_request", None) or {}
+        request_id = raw_request.get("requestId")
+        current_tab = resolve_live_tab(tab)
+        listener = getattr(current_tab, "listen", None)
+        driver = getattr(listener, "_driver", None)
+        if not request_id or driver is None:
+            return None
+        result = driver.run("Network.getResponseBody", requestId=request_id) or {}
+        if "body" not in result:
+            return None
+        body = result.get("body") or ""
+        if result.get("base64Encoded"):
+            return base64.b64decode(body)
+        return body.encode("utf-8", errors="replace")
+    except Exception:
+        return None
 
 
 def python_fallback_request_headers(request):
@@ -689,8 +793,8 @@ def execute_browser_head_probe(tab, request):
 
 def execute_head_request(tab, request, timeout_seconds, allow_static_resources):
     configure_tab_network(tab, allow_static_resources)
-    ensure_fetch_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
+    ensure_fetch_context(tab, request, timeout_seconds)
 
     execute_browser_head_probe(tab, request)
 
@@ -810,10 +914,19 @@ def is_http_url(value):
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def same_page_url(left, right):
+    if not is_http_url(left) or not is_http_url(right):
+        return False
+    return normalized_request_url(left) == normalized_request_url(right)
+
+
 def preferred_context_url(request):
     referer = header_value(request, "Referer")
     if is_http_url(referer):
         return referer
+    origin = header_value(request, "Origin")
+    if is_http_url(origin):
+        return origin_url(origin)
     return origin_url(request["url"])
 
 
@@ -1292,9 +1405,15 @@ def build_result_metadata_headers(tab, request, result, observed_packet=None):
         ("Accept-Encoding", "X-PassRS-Observed-Request-Accept-Encoding"),
     ]
     if observed_packet is not None:
-        request_headers = getattr(getattr(observed_packet, "request", None), "headers", None)
+        try:
+            request_headers = getattr(getattr(observed_packet, "request", None), "headers", None)
+        except Exception:
+            request_headers = None
         response_obj = getattr(observed_packet, "response", None)
-        response_headers = getattr(response_obj, "headers", None)
+        try:
+            response_headers = getattr(response_obj, "headers", None)
+        except Exception:
+            response_headers = packet_response_extra_info(observed_packet).get("headers")
         for original_name, passrs_name in observed_pairs:
             value = packet_header_value(request_headers, original_name)
             if value:
@@ -1358,23 +1477,20 @@ def ensure_origin(tab, request, timeout_seconds):
 
 
 def ensure_post_context(tab, request, timeout_seconds):
-    current_url = getattr(tab, "url", "") or ""
+    current_url = safe_tab_url(tab)
     referer = header_value(request, "Referer")
-    if is_http_url(referer) and (current_url == referer or current_url.startswith(referer)):
+    if is_http_url(referer):
+        if same_page_url(current_url, referer):
+            return
+        tab.get(referer, retry=0, interval=0, timeout=timeout_seconds)
         return
-    if current_origin(tab) == origin_url(request["url"]):
-        return
-    tab.get(preferred_context_url(request), retry=0, interval=0, timeout=timeout_seconds)
+    context_url = preferred_context_url(request)
+    if current_origin(tab) != origin_url(context_url):
+        tab.get(context_url, retry=0, interval=0, timeout=timeout_seconds)
 
 
 def ensure_fetch_context(tab, request, timeout_seconds):
-    current_url = getattr(tab, "url", "") or ""
-    referer = header_value(request, "Referer")
-    if is_http_url(referer) and (current_url == referer or current_url.startswith(referer)):
-        return
-    if current_origin(tab) == origin_url(request["url"]):
-        return
-    tab.get(preferred_context_url(request), retry=0, interval=0, timeout=timeout_seconds)
+    ensure_post_context(tab, request, timeout_seconds)
 
 
 def packet_response(packet):
@@ -1385,10 +1501,14 @@ def packet_response(packet):
 
 def packet_status(packet):
     response = packet_response(packet)
-    if response is None:
-        return 0
     try:
-        return int(getattr(response, "status", 0) or 0)
+        status = int(getattr(response, "status", 0) or 0)
+        if status > 0:
+            return status
+    except Exception:
+        pass
+    try:
+        return int(packet_response_extra_info(packet).get("statusCode", 0) or 0)
     except Exception:
         return 0
 
@@ -1646,7 +1766,14 @@ def parse_script_response(tab, result_text, request):
     }
 
 
-def execute_xhr_request(tab, request):
+def script_timeout_millis(timeout_seconds):
+    try:
+        return max(1000, int(float(timeout_seconds) * 1000))
+    except (TypeError, ValueError):
+        return 15000
+
+
+def execute_xhr_request(tab, request, timeout_seconds):
     headers = allowed_script_headers(request)
     script = """
 (async () => {
@@ -1654,6 +1781,7 @@ def execute_xhr_request(tab, request):
     const url = __URL__;
     const headers = __HEADERS__;
     const bodyBase64 = __BODY__;
+    const timeoutMs = __TIMEOUT_MS__;
     const decode = (value) => {
         if (!value) {
             return new Uint8Array(0);
@@ -1680,6 +1808,7 @@ def execute_xhr_request(tab, request):
             xhr.open(method, url, true);
             xhr.withCredentials = true;
             xhr.responseType = "arraybuffer";
+            xhr.timeout = timeoutMs;
             for (const [name, value] of Object.entries(headers)) {
                 try {
                     xhr.setRequestHeader(name, value);
@@ -1708,6 +1837,7 @@ def execute_xhr_request(tab, request):
             };
             xhr.onerror = () => resolve(JSON.stringify({error: "XMLHttpRequest failed"}));
             xhr.ontimeout = () => resolve(JSON.stringify({error: "XMLHttpRequest timeout"}));
+            xhr.onabort = () => resolve(JSON.stringify({error: "XMLHttpRequest aborted"}));
             try {
                 xhr.send(body.length ? body : null);
             } catch (e) {
@@ -1724,10 +1854,11 @@ def execute_xhr_request(tab, request):
     script = script.replace("__URL__", json.dumps(request["url"]))
     script = script.replace("__HEADERS__", json.dumps(headers, ensure_ascii=False))
     script = script.replace("__BODY__", json.dumps(base64.b64encode(request["body"]).decode("ascii")))
+    script = script.replace("__TIMEOUT_MS__", json.dumps(script_timeout_millis(timeout_seconds)))
     return parse_script_response(tab, evaluate_async_json(tab, script), request)
 
 
-def execute_fetch_request(tab, request):
+def execute_fetch_request(tab, request, timeout_seconds):
     headers = allowed_script_headers(request)
     script = """
 (async () => {
@@ -1737,6 +1868,7 @@ def execute_fetch_request(tab, request):
     const bodyBase64 = __BODY__;
     const referrer = __REFERRER__;
     const fetchMode = __FETCH_MODE__;
+    const timeoutMs = __TIMEOUT_MS__;
     const decode = (value) => {
         if (!value) {
             return new Uint8Array(0);
@@ -1756,8 +1888,11 @@ def execute_fetch_request(tab, request):
         }
         return btoa(binary);
     };
+    let timeoutId = null;
     try {
         const body = decode(bodyBase64);
+        const controller = new AbortController();
+        timeoutId = setTimeout(() => controller.abort(), timeoutMs);
         const options = {
             method,
             headers,
@@ -1765,6 +1900,7 @@ def execute_fetch_request(tab, request):
             redirect: "follow",
             cache: "no-store",
             referrer: referrer || undefined,
+            signal: controller.signal,
         };
         if (fetchMode) {
             options.mode = fetchMode;
@@ -1788,6 +1924,10 @@ def execute_fetch_request(tab, request):
         });
     } catch (e) {
         return JSON.stringify({error: String(e)});
+    } finally {
+        if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+        }
     }
 })();
 """
@@ -1797,20 +1937,67 @@ def execute_fetch_request(tab, request):
     script = script.replace("__BODY__", json.dumps(base64.b64encode(request["body"]).decode("ascii")))
     script = script.replace("__REFERRER__", json.dumps(header_value(request, "Referer")))
     script = script.replace("__FETCH_MODE__", json.dumps(request_fetch_mode(request)))
+    script = script.replace("__TIMEOUT_MS__", json.dumps(script_timeout_millis(timeout_seconds)))
     return parse_script_response(tab, evaluate_async_json(tab, script), request)
 
 
-def execute_script_request(tab, request):
-    try:
-        return execute_fetch_request(tab, request)
-    except Exception:
-        return execute_xhr_request(tab, request)
+def execute_script_request(tab, request, timeout_seconds):
+    # Retrying a failed fetch with XHR can submit a POST/PUT/PATCH/DELETE twice.
+    # Both transports are subject to the same page security policy, so recover
+    # the first request through the CDP listener instead of blindly replaying it.
+    return execute_fetch_request(tab, request, timeout_seconds)
 
 
-def execute_get_like_request(tab, request):
+def execute_get_like_request(tab, request, timeout_seconds):
     if request_has_body(request):
-        return execute_xhr_request(tab, request)
-    return execute_fetch_request(tab, request)
+        return execute_xhr_request(tab, request, timeout_seconds)
+    return execute_script_request(tab, request, timeout_seconds)
+
+
+def packet_failure_summary(packet):
+    if packet is None:
+        return ""
+    details = []
+    raw_info = getattr(packet, "_raw_fail_info", None)
+    if isinstance(raw_info, dict):
+        for name in ("errorText", "blockedReason"):
+            value = raw_info.get(name)
+            if value:
+                details.append(f"{name}={sanitize_metadata_value(value, 256)}")
+        cors_status = raw_info.get("corsErrorStatus")
+        if cors_status:
+            details.append("corsErrorStatus=" + sanitize_metadata_value(cors_status, 384))
+    return ", ".join(details)
+
+
+def execute_script_request_with_observation(tab, request, timeout_seconds):
+    script_error = None
+    try:
+        result = execute_script_request(tab, request, timeout_seconds)
+        if int(result.get("status", 0) or 0) > 0:
+            return result
+        script_error = RuntimeError("browser fetch returned an opaque or zero-status response")
+    except Exception as exc:
+        script_error = exc
+
+    packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=True)
+    packet_result = observed_result_from_packet(packet, request, tab)
+    if packet_result is not None:
+        packet_result = finalize_result_with_metadata(tab, request, packet_result, packet)
+        packet_result["_passrs_observed_result"] = True
+        return packet_result
+
+    details = [str(script_error) or script_error.__class__.__name__]
+    context_url = safe_tab_url(tab)
+    if context_url:
+        details.append("context=" + sanitize_metadata_value(context_url, 384))
+    fetch_mode = request_fetch_mode(request)
+    if fetch_mode:
+        details.append("mode=" + fetch_mode)
+    packet_failure = packet_failure_summary(packet)
+    if packet_failure:
+        details.append(packet_failure)
+    raise RuntimeError("browser script request failed: " + " | ".join(details)) from script_error
 
 
 def content_type_charset(content_type):
@@ -3141,10 +3328,10 @@ def finalize_result_with_metadata(tab, request, result, observed_packet=None):
 
 def execute_navigation_non_form_post_request(tab, request, timeout_seconds, allow_static_resources):
     configure_tab_network(tab, allow_static_resources)
-    ensure_post_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
+    ensure_post_context(tab, request, timeout_seconds)
 
-    initial_result = execute_script_request(tab, request)
+    initial_result = execute_script_request_with_observation(tab, request, timeout_seconds)
     if not is_post_challenge_result(initial_result):
         return initial_result
 
@@ -3163,8 +3350,8 @@ def execute_navigation_non_form_post_request(tab, request, timeout_seconds, allo
 
 
 def execute_navigation_post_request(tab, request, timeout_seconds):
-    ensure_post_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
+    ensure_post_context(tab, request, timeout_seconds)
     if is_empty_body_post(request):
         submit_empty_post_request(tab, request)
         wait_for_initial_load(tab, timeout_seconds)
@@ -3208,9 +3395,9 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
         return execute_navigation_non_form_post_request(tab, request, timeout_seconds, allow_static_resources)
 
     configure_tab_network(tab, allow_static_resources)
-    ensure_post_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
-    result = execute_script_request(tab, request)
+    ensure_post_context(tab, request, timeout_seconds)
+    result = execute_script_request_with_observation(tab, request, timeout_seconds)
     if not is_post_challenge_result(result):
         return result
 
@@ -3230,7 +3417,7 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
         if page_result is not None:
             return page_result
         ensure_post_context(tab, request, timeout_seconds)
-        retry_result = execute_script_request(tab, request)
+        retry_result = execute_script_request_with_observation(tab, request, timeout_seconds)
         if not is_post_challenge_result(retry_result):
             return retry_result
         last_result = retry_result
@@ -3239,25 +3426,9 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
 
 def execute_generic_script_method_request(tab, request, timeout_seconds, allow_static_resources):
     configure_tab_network(tab, allow_static_resources)
-    ensure_fetch_context(tab, request, timeout_seconds)
     set_request_cookies(tab, request)
-    method = request_method(request)
-    try:
-        result = execute_script_request(tab, request)
-    except Exception:
-        packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=True)
-        packet_result = observed_result_from_packet(packet, request)
-        if packet_result is not None:
-            return packet_result
-        if method == "HEAD":
-            return execute_python_head_request(request, timeout_seconds)
-        raise
-    if method == "HEAD" and int(result.get("status", 0) or 0) <= 0:
-        packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=True)
-        packet_result = head_result_from_observed_packet(packet, request)
-        if packet_result is not None:
-            return packet_result
-        return execute_python_head_request(request, timeout_seconds)
+    ensure_fetch_context(tab, request, timeout_seconds)
+    result = execute_script_request_with_observation(tab, request, timeout_seconds)
     if not is_post_challenge_result(result):
         return result
 
@@ -3282,7 +3453,7 @@ def execute_get_request(tab, request, timeout_seconds, allow_static_resources):
     set_request_cookies(tab, request)
     if not is_navigation_get(request):
         ensure_fetch_context(tab, request, timeout_seconds)
-        return execute_get_like_request(tab, request)
+        return execute_script_request_with_observation(tab, request, timeout_seconds)
     current_tab = resolve_live_tab(tab)
     current_tab.get(request["url"], retry=0, interval=0, timeout=timeout_seconds)
     wait_for_initial_load(current_tab, timeout_seconds)
@@ -3375,7 +3546,11 @@ def navigate(args):
             continue
         try:
             result = execute_request(tab, request, timeout_seconds, args.load_static_resources)
-            observed_packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=False)
+            observed_packet = None
+            if not result.pop("_passrs_observed_result", False):
+                observed_packet = wait_for_observed_request_packet(
+                    tab, request, timeout_seconds, require_response=False
+                )
             result = finalize_result_with_metadata(tab, request, result, observed_packet)
             print_response(result)
             return
@@ -3406,7 +3581,11 @@ def navigate(args):
         start_observed_request_capture(tab, request)
         apply_managed_request_headers(tab, request)
         result = execute_request(tab, request, timeout_seconds, args.load_static_resources)
-        observed_packet = wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=False)
+        observed_packet = None
+        if not result.pop("_passrs_observed_result", False):
+            observed_packet = wait_for_observed_request_packet(
+                tab, request, timeout_seconds, require_response=False
+            )
         result = finalize_result_with_metadata(tab, request, result, observed_packet)
         print_response(result)
         return

@@ -56,7 +56,6 @@ final class BrowserMessageCodec {
                 .append(safeReason)
                 .append("\r\n");
 
-        boolean hasContentLength = false;
         if (headers != null) {
             for (String headerLine : headers) {
                 int index = headerLine == null ? -1 : headerLine.indexOf(':');
@@ -64,18 +63,15 @@ final class BrowserMessageCodec {
                     continue;
                 }
                 String name = headerLine.substring(0, index).trim();
-                if ("transfer-encoding".equalsIgnoreCase(name) || "content-encoding".equalsIgnoreCase(name)) {
+                if ("transfer-encoding".equalsIgnoreCase(name)
+                        || "content-encoding".equalsIgnoreCase(name)
+                        || "content-length".equalsIgnoreCase(name)) {
                     continue;
-                }
-                if ("content-length".equalsIgnoreCase(name)) {
-                    hasContentLength = true;
                 }
                 headerBuilder.append(name).append(": ").append(headerLine.substring(index + 1).trim()).append("\r\n");
             }
         }
-        if (!hasContentLength) {
-            headerBuilder.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
-        }
+        headerBuilder.append("Content-Length: ").append(bodyBytes.length).append("\r\n");
         headerBuilder.append("\r\n");
 
         byte[] headerBytes = headerBuilder.toString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);

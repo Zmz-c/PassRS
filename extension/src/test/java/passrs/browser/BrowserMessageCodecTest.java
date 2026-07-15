@@ -28,7 +28,12 @@ class BrowserMessageCodecTest {
         byte[] response = BrowserMessageCodec.buildHttpResponseBytes(
                 200,
                 "",
-                List.of("Transfer-Encoding: chunked", "Content-Encoding: gzip", "X-Test: yes"),
+                List.of(
+                        "Transfer-Encoding: chunked",
+                        "Content-Encoding: gzip",
+                        "Content-Length: 999",
+                        "X-Test: yes"
+                ),
                 "body".getBytes(StandardCharsets.UTF_8)
         );
 
@@ -36,6 +41,7 @@ class BrowserMessageCodecTest {
         assertThat(text).startsWith("HTTP/1.1 200 OK\r\n");
         assertThat(text).contains("X-Test: yes\r\n");
         assertThat(text).contains("Content-Length: 4\r\n");
+        assertThat(text).doesNotContain("Content-Length: 999");
         assertThat(text).doesNotContain("Transfer-Encoding");
         assertThat(text).doesNotContain("Content-Encoding");
     }

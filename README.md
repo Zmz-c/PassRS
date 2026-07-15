@@ -32,6 +32,7 @@ This is useful when:
 - Browser reuse to reduce repeated launches
 - Auto-save configuration in the extension UI
 - Local HTTPS relay for Burp-to-browser bridging
+- Local MCP Streamable HTTP endpoint for direct AI client calls
 
 ## Workflow
 
@@ -47,6 +48,8 @@ flowchart LR
     D --> C
     C --> B
     B --> H[Burp Response View]
+    I[AI / MCP Client] --> J[Local MCP Endpoint]
+    J --> D
 ```
 
 ## Requirements
@@ -109,6 +112,54 @@ extension/target/PassRS-v<version>.jar
    - Burp tool modules
    - target regex
    - static resource loading
+6. Use the `MCP Address` shown in the Runtime panel for clients that support MCP Streamable HTTP.
+
+## MCP Usage
+
+When PassRS is loaded, it starts a localhost-only MCP endpoint on a random port:
+
+```text
+http://127.0.0.1:<port>/mcp
+```
+
+Send JSON-RPC requests with `Content-Type: application/json`. Browser requests with a non-loopback `Origin` are rejected to protect the local endpoint from cross-site request forgery and DNS rebinding.
+
+Available tools:
+
+- `passrs_browser_request`: execute an HTTP request in the reused PassRS real-browser context.
+- `passrs_close_browser`: close the current browser session and cancel the active browser bridge process.
+
+Typical `passrs_browser_request` arguments:
+
+```json
+{
+  "method": "GET",
+  "url": "https://example.com/",
+  "headers": {
+    "User-Agent": "PassRS MCP"
+  },
+  "body": "",
+  "maxBodyTextBytes": 65536,
+  "includeBodyBase64": false
+}
+```
+
+Example JSON-RPC call:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "passrs_browser_request",
+    "arguments": {
+      "method": "GET",
+      "url": "https://example.com/"
+    }
+  }
+}
+```
 
 ## Configuration Overview
 

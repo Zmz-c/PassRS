@@ -207,21 +207,39 @@ public final class BrowserRequestManager {
         Exception lastError = null;
         List<String> errors = new ArrayList<>();
         for (List<String> command : commands) {
+            ProcessExecutor.ProcessResult result;
             try {
-                ProcessExecutor.ProcessResult result = processExecutor.run(command, timeoutMillis, workspaceRoot);
-                if (result.exitCode() != 0) {
-                    throw new IllegalStateException("python browser bridge exit=" + result.exitCode() + " output=" + result.output());
-                }
-                pythonEnvironmentResolver.rememberSuccessfulPythonCommand(command, scriptFile);
-                return result.output();
-            } catch (Exception e) {
+                result = processExecutor.run(command, timeoutMillis, workspaceRoot);
+            } catch (IOException e) {
                 lastError = e;
-                errors.add(String.join(" ", command.subList(0, Math.min(command.size(), 2))) + ": " + safeMessage(e));
+                errors.add(commandLabel(command) + ": " + safeMessage(e));
+                continue;
+            } catch (Exception e) {
+                errors.add(commandLabel(command) + ": " + safeMessage(e));
+                throw bridgeExecutionFailure(errors, e);
             }
+            if (result.exitCode() != 0) {
+                IllegalStateException error = new IllegalStateException(
+                        "python browser bridge exit=" + result.exitCode() + " output=" + result.output());
+                errors.add(commandLabel(command) + ": " + safeMessage(error));
+                // The interpreter already ran the bridge. Trying another interpreter can
+                // replay a non-idempotent request whose response was merely unreadable.
+                throw bridgeExecutionFailure(errors, error);
+            }
+            pythonEnvironmentResolver.rememberSuccessfulPythonCommand(command, scriptFile);
+            return result.output();
         }
-        throw new IllegalStateException(lastError == null
+        throw bridgeExecutionFailure(errors, lastError);
+    }
+
+    private String commandLabel(List<String> command) {
+        return String.join(" ", command.subList(0, Math.min(command.size(), 2)));
+    }
+
+    private IllegalStateException bridgeExecutionFailure(List<String> errors, Exception error) {
+        return new IllegalStateException(error == null
                 ? "python browser bridge execute failed"
-                : pythonEnvironmentResolver.buildFailureMessage(errors, lastError), lastError);
+                : pythonEnvironmentResolver.buildFailureMessage(errors, error), error);
     }
 
     private BrowserResponse parseResponse(String output) {
