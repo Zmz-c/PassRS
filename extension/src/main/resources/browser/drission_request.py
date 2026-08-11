@@ -865,8 +865,12 @@ def is_navigation_post(request):
     fetch_dest = header_value(request, "Sec-Fetch-Dest").lower()
     if fetch_mode == "navigate":
         return True
+    if fetch_mode in SCRIPT_FRIENDLY_FETCH_MODES:
+        return False
     if fetch_dest in ("document", "frame", "iframe"):
         return True
+    if fetch_dest == "empty":
+        return False
     if header_value(request, "Upgrade-Insecure-Requests") == "1":
         return True
     return request_accepts_html(request)
@@ -1341,6 +1345,17 @@ def start_observed_request_capture(tab, request):
         return False
 
 
+def restart_observed_request_capture(tab, request):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return False
+    try:
+        current_tab.listen.stop()
+    except Exception:
+        pass
+    return start_observed_request_capture(current_tab, request)
+
+
 def wait_for_observed_request_packet(tab, request, timeout_seconds, require_response=False):
     current_tab = resolve_live_tab(tab)
     if current_tab is None:
@@ -1763,6 +1778,8 @@ def parse_script_response(tab, result_text, request):
         "navigation_kind": result.get("navigation_kind", ""),
         "challenge_like": bool(result.get("challenge_like")),
         "redirected": bool(result.get("redirected")),
+        "request_method": (result.get("request_method") or "").upper(),
+        "request_url": result.get("request_url") or "",
     }
 
 
@@ -1971,6 +1988,7 @@ def packet_failure_summary(packet):
 
 
 def execute_script_request_with_observation(tab, request, timeout_seconds):
+    restart_observed_request_capture(tab, request)
     script_error = None
     try:
         result = execute_script_request(tab, request, timeout_seconds)
@@ -2576,6 +2594,13 @@ def load_challenge_page(tab, request, result, timeout_seconds):
             }
         }
     };
+    const absoluteUrl = (value) => {
+        try {
+            return new URL(String(value || ''), location.href || url).href;
+        } catch (e) {
+            return String(value || '');
+        }
+    };
     const looksLikeChallengeBody = (text) => {
         const lowered = String(text || '').toLowerCase();
         if (!lowered || lowered.length > 220000) {
@@ -2692,6 +2717,10 @@ def load_challenge_page(tab, request, result, timeout_seconds):
         window.__passrsCleanupTimer = setTimeout(restoreHooks, cleanupTimeoutMs);
         if (originalFetch) {
             window.fetch = async (...args) => {
+                const input = args[0];
+                const options = args[1] || {};
+                const requestMethod = String(options.method || (input && input.method) || 'GET').toUpperCase();
+                const requestUrl = absoluteUrl((input && input.url) || input || url);
                 const response = await originalFetch(...args);
                 try {
                     const clone = response.clone();
@@ -2704,7 +2733,9 @@ def load_challenge_page(tab, request, result, timeout_seconds):
                         headers: headersText,
                         body_base64: encode(bodyBytes),
                         final_url: response.url || (args[0] && String(args[0])) || url,
-                        challenge_like: challengeLike
+                        challenge_like: challengeLike,
+                        request_method: requestMethod,
+                        request_url: requestUrl
                     });
                     if (!challengeLike) {
                         restoreHooks();
@@ -2758,7 +2789,9 @@ def load_challenge_page(tab, request, result, timeout_seconds):
                         headers: headersText,
                         body_base64: encode(bodyBytes),
                         final_url: xhr.responseURL || xhr.__passrsUrl || url,
-                        challenge_like: challengeLike
+                        challenge_like: challengeLike,
+                        request_method: String(xhr.__passrsMethod || 'GET').toUpperCase(),
+                        request_url: absoluteUrl(xhr.__passrsUrl || url)
                     });
                     if (!challengeLike) {
                         restoreHooks();
@@ -2839,6 +2872,55 @@ def wait_for_captured_browser_result(tab, request, timeout_seconds):
         if result is not None:
             return result
         time.sleep(GET_POLL_INTERVAL_SECONDS)
+    return None
+
+
+def captured_result_matches_request(result, request):
+    if not result:
+        return False
+    captured_method = (result.get("request_method") or "").upper()
+    captured_url = result.get("request_url") or ""
+    if not captured_method or not captured_url:
+        return False
+    return (
+        captured_method == request_method(request)
+        and normalized_request_url(captured_url) == normalized_request_url(request["url"])
+    )
+
+
+def wait_for_matching_captured_browser_result(tab, request, timeout_seconds):
+    deadline = time.time() + max(0.3, min(timeout_seconds, POST_CHALLENGE_WAIT_SECONDS))
+    while time.time() < deadline:
+        result = captured_browser_result(tab, request)
+        if (
+            result is not None
+            and not result.get("navigation_pending")
+            and captured_result_matches_request(result, request)
+            and not is_post_challenge_result(result)
+        ):
+            return result
+        time.sleep(GET_POLL_INTERVAL_SECONDS)
+    return None
+
+
+def wait_for_observed_non_challenge_result(tab, request, timeout_seconds):
+    current_tab = resolve_live_tab(tab)
+    if current_tab is None:
+        return None
+    deadline = time.time() + max(0.6, min(timeout_seconds, 2.4))
+    while time.time() < deadline:
+        try:
+            packet = current_tab.listen.wait(timeout=min(0.6, max(0.1, deadline - time.time())))
+        except Exception:
+            return None
+        if not packet or not packet_matches_request(packet, request) or not packet_has_response(packet):
+            continue
+        result = observed_result_from_packet(packet, request, tab)
+        if result is None or is_post_challenge_result(result):
+            continue
+        result = finalize_result_with_metadata(tab, request, result, packet)
+        result["_passrs_observed_result"] = True
+        return result
     return None
 
 
@@ -3403,6 +3485,7 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
 
     last_result = result
     for _ in range(POST_RETRY_ATTEMPTS):
+        restart_observed_request_capture(tab, request)
         load_challenge_page(tab, request, last_result, timeout_seconds)
         if is_navigation_post(request):
             navigation_result = complete_navigation_post_challenge(tab, request, timeout_seconds)
@@ -3410,12 +3493,12 @@ def execute_post_request(tab, request, timeout_seconds, allow_static_resources):
                 return navigation_result
             return last_result
         wait_for_post_challenge(tab, timeout_seconds)
-        captured_result = wait_for_captured_browser_result(tab, request, timeout_seconds)
-        if captured_result is not None and not is_post_challenge_result(captured_result):
+        captured_result = wait_for_matching_captured_browser_result(tab, request, timeout_seconds)
+        if captured_result is not None:
             return captured_result
-        page_result = current_page_result(tab, request)
-        if page_result is not None:
-            return page_result
+        observed_result = wait_for_observed_non_challenge_result(tab, request, timeout_seconds)
+        if observed_result is not None:
+            return observed_result
         ensure_post_context(tab, request, timeout_seconds)
         retry_result = execute_script_request_with_observation(tab, request, timeout_seconds)
         if not is_post_challenge_result(retry_result):

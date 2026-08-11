@@ -131,6 +131,119 @@ class DrissionRequestTest(unittest.TestCase):
         packet.request.url = packet.url
         self.assertFalse(BRIDGE.packet_matches_request(packet, request))
 
+    def test_api_post_with_html_accept_is_not_navigation_when_fetch_headers_are_explicit(self):
+        request = self.request()
+        request["headers"].extend([
+            "Accept: text/html,application/xhtml+xml",
+            "Sec-Fetch-Mode: cors",
+            "Sec-Fetch-Dest: empty",
+        ])
+        self.assertFalse(BRIDGE.is_navigation_post(request))
+
+    def test_captured_challenge_response_must_match_original_post(self):
+        request = self.request()
+        matching = {
+            "request_method": "POST",
+            "request_url": request["url"],
+        }
+        unrelated = {
+            "request_method": "GET",
+            "request_url": request["url"],
+        }
+        self.assertTrue(BRIDGE.captured_result_matches_request(matching, request))
+        self.assertFalse(BRIDGE.captured_result_matches_request(unrelated, request))
+        unrelated["request_method"] = "POST"
+        unrelated["request_url"] = request["url"] + "/other"
+        self.assertFalse(BRIDGE.captured_result_matches_request(unrelated, request))
+
+    def test_api_post_replays_after_challenge_instead_of_returning_current_page(self):
+        request = self.request()
+        challenge = {
+            "status": 412,
+            "headers": ["Content-Type: text/html"],
+            "content_type": "text/html",
+            "body": b"<html><script>document.cookie='token=ok';location.reload()</script></html>",
+        }
+        api_result = {
+            "status": 200,
+            "headers": ["Content-Type: application/json"],
+            "content_type": "application/json",
+            "body": b'{"ok":true}',
+        }
+        replacements = {
+            "configure_tab_network": lambda *_: None,
+            "set_request_cookies": lambda *_: None,
+            "ensure_post_context": lambda *_: None,
+            "restart_observed_request_capture": lambda *_: True,
+            "load_challenge_page": lambda *_: None,
+            "wait_for_post_challenge": lambda *_: None,
+            "wait_for_matching_captured_browser_result": lambda *_: None,
+            "wait_for_observed_non_challenge_result": lambda *_: None,
+            "current_page_result": lambda *_: (_ for _ in ()).throw(
+                AssertionError("API POST must not return the current HTML page")
+            ),
+        }
+        originals = {name: getattr(BRIDGE, name) for name in replacements}
+        responses = iter((challenge, api_result))
+        original_execute = BRIDGE.execute_script_request_with_observation
+        try:
+            for name, replacement in replacements.items():
+                setattr(BRIDGE, name, replacement)
+            BRIDGE.execute_script_request_with_observation = lambda *_: next(responses)
+            result = BRIDGE.execute_post_request(None, request, 1, False)
+        finally:
+            BRIDGE.execute_script_request_with_observation = original_execute
+            for name, original in originals.items():
+                setattr(BRIDGE, name, original)
+
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["content_type"], "application/json")
+        self.assertEqual(result["body"], b'{"ok":true}')
+
+    def test_matching_auto_replayed_post_is_returned_without_duplicate_submission(self):
+        request = self.request()
+        challenge = {
+            "status": 412,
+            "headers": ["Content-Type: text/html"],
+            "content_type": "text/html",
+            "body": b"<html><script>document.cookie='token=ok'</script></html>",
+        }
+        captured = {
+            "status": 200,
+            "headers": ["Content-Type: application/json"],
+            "content_type": "application/json",
+            "body": b'{"auto":true}',
+            "request_method": "POST",
+            "request_url": request["url"],
+        }
+        replacements = {
+            "configure_tab_network": lambda *_: None,
+            "set_request_cookies": lambda *_: None,
+            "ensure_post_context": lambda *_: None,
+            "restart_observed_request_capture": lambda *_: True,
+            "load_challenge_page": lambda *_: None,
+            "wait_for_post_challenge": lambda *_: None,
+            "wait_for_matching_captured_browser_result": lambda *_: captured,
+            "wait_for_observed_non_challenge_result": lambda *_: (_ for _ in ()).throw(
+                AssertionError("matching captured POST should be returned first")
+            ),
+        }
+        originals = {name: getattr(BRIDGE, name) for name in replacements}
+        calls = []
+        original_execute = BRIDGE.execute_script_request_with_observation
+        try:
+            for name, replacement in replacements.items():
+                setattr(BRIDGE, name, replacement)
+            BRIDGE.execute_script_request_with_observation = lambda *_: calls.append(True) or challenge
+            result = BRIDGE.execute_post_request(None, request, 1, False)
+        finally:
+            BRIDGE.execute_script_request_with_observation = original_execute
+            for name, original in originals.items():
+                setattr(BRIDGE, name, original)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["body"], b'{"auto":true}')
+
 
 if __name__ == "__main__":
     unittest.main()
